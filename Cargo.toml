@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/domain",
+    "crates/contracts",
+    "crates/media-core",
+    "crates/media-ffmpeg",
+    "crates/control-plane",
+    "crates/storage",
+    "apps/worker",
+    "apps/server",
+    "apps/cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+authors = ["Bean-Harbor"]
+repository = "https://github.com/Bean-Harbor/HarborLookout"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "net", "process", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -1,0 +1,17 @@
+/target/
+/.idea/
+/.vscode/
+/.DS_Store
+Thumbs.db
+
+# Local configuration
+.env
+.env.*
+/data/
+
+# UI outputs
+/ui/node_modules/
+/ui/dist/
+
+# Fixtures generated during local testing
+/fixtures/generated/
