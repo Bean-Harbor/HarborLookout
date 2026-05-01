@@ -4,16 +4,24 @@ use std::{fs, path::PathBuf};
 
 use anyhow::Result;
 use harborlookout_contracts::{
-    HealthResponse, ListCamerasResponse, ListRecordingSegmentsRequest, ListRecordingSegmentsResponse,
-    ProbeCameraRequest, ProbeCameraResponse, RecordingStatusRequest,
+    AnalysisStatusRequest, AnalysisStatusResponse, ArtifactRetentionCleanupRequest,
+    ArtifactRetentionCleanupResponse, ArtifactRetentionPreviewRequest, ArtifactRetentionPreviewResponse,
+    CreateSurveillanceEventRequest, CreateSurveillanceEventResponse, HealthResponse, ListCamerasResponse,
+    ListEventArtifactsRequest, ListEventArtifactsResponse, ListRecordingSegmentsRequest,
+    ListRecordingSegmentsResponse, ListSurveillanceEventsRequest, ListSurveillanceEventsResponse,
+    ProbeCameraRequest, ProbeCameraResponse, PullAnalysisEventsResponse, RecordingStatusRequest,
     RecordingStatusResponse, RegisterCameraRequest, RegisterCameraResponse, RestartRecordingRequest,
-    RestartRecordingResponse, StartRecordingRequest, StartRecordingResponse, StopRecordingRequest,
-    StopRecordingResponse, SyncRecordingSegmentsRequest, SyncRecordingSegmentsResponse,
-    RetentionPreviewRequest, RetentionPreviewResponse, StorageSummaryResponse,
+    RestartRecordingResponse, RetentionCleanupRequest, RetentionCleanupResponse,
+    RetentionPreviewRequest, RetentionPreviewResponse, StartAnalysisRequest, StartAnalysisResponse,
+    StartRecordingRequest, StartRecordingResponse, StopAnalysisRequest, StopAnalysisResponse,
+    StopRecordingRequest, StopRecordingResponse, StorageSummaryResponse, SyncAnalysisEventsRequest,
+    SyncAnalysisEventsResponse, SyncRecordingSegmentsRequest, SyncRecordingSegmentsResponse,
 };
 use harborlookout_domain::{Camera, RecordingSegment, RecordingSession, RecordingState, StreamRole, WorkerState};
 use harborlookout_media_core::MediaBackend;
-use harborlookout_storage::{CameraStore, RecordingSegmentStore, RecordingSessionStore};
+use harborlookout_storage::{
+    CameraStore, EventArtifactStore, RecordingSegmentStore, RecordingSessionStore, SurveillanceEventStore,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +49,26 @@ pub trait WorkerClient: Send + Sync {
         &'a self,
         request: &'a RecordingStatusRequest,
     ) -> Pin<Box<dyn Future<Output = Result<RecordingStatusResponse>> + Send + 'a>>;
+
+    fn start_analysis<'a>(
+        &'a self,
+        request: &'a StartAnalysisRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<StartAnalysisResponse>> + Send + 'a>>;
+
+    fn stop_analysis<'a>(
+        &'a self,
+        request: &'a StopAnalysisRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<StopAnalysisResponse>> + Send + 'a>>;
+
+    fn analysis_status<'a>(
+        &'a self,
+        request: &'a AnalysisStatusRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AnalysisStatusResponse>> + Send + 'a>>;
+
+    fn pull_analysis_events<'a>(
+        &'a self,
+        request: &'a SyncAnalysisEventsRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<PullAnalysisEventsResponse>> + Send + 'a>>;
 }
 
 #[derive(Clone)]
@@ -109,26 +137,76 @@ impl WorkerClient for HttpWorkerClient {
     ) -> Pin<Box<dyn Future<Output = Result<RecordingStatusResponse>> + Send + 'a>> {
         Box::pin(async move { self.post_json("/api/recordings/status", request).await })
     }
+
+    fn start_analysis<'a>(
+        &'a self,
+        request: &'a StartAnalysisRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<StartAnalysisResponse>> + Send + 'a>> {
+        Box::pin(async move { self.post_json("/api/analysis/start", request).await })
+    }
+
+    fn stop_analysis<'a>(
+        &'a self,
+        request: &'a StopAnalysisRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<StopAnalysisResponse>> + Send + 'a>> {
+        Box::pin(async move { self.post_json("/api/analysis/stop", request).await })
+    }
+
+    fn analysis_status<'a>(
+        &'a self,
+        request: &'a AnalysisStatusRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AnalysisStatusResponse>> + Send + 'a>> {
+        Box::pin(async move { self.post_json("/api/analysis/status", request).await })
+    }
+
+    fn pull_analysis_events<'a>(
+        &'a self,
+        request: &'a SyncAnalysisEventsRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<PullAnalysisEventsResponse>> + Send + 'a>> {
+        Box::pin(async move { self.post_json("/api/analysis/events/pull", request).await })
+    }
 }
 
-pub struct ControlPlane<B: MediaBackend, S: CameraStore + RecordingSessionStore + RecordingSegmentStore, W: WorkerClient> {
+pub struct ControlPlane<
+    B: MediaBackend,
+    S: CameraStore + RecordingSessionStore + RecordingSegmentStore + SurveillanceEventStore + EventArtifactStore,
+    W: WorkerClient,
+> {
     backend: B,
     store: S,
     worker: W,
 }
 
-impl<B: MediaBackend, S: CameraStore + RecordingSessionStore + RecordingSegmentStore, W: WorkerClient> ControlPlane<B, S, W> {
+impl<
+        B: MediaBackend,
+        S: CameraStore + RecordingSessionStore + RecordingSegmentStore + SurveillanceEventStore + EventArtifactStore,
+        W: WorkerClient,
+    > ControlPlane<B, S, W>
+{
     pub fn new(backend: B, store: S, worker: W) -> Self {
         Self { backend, store, worker }
     }
 
-    pub fn register_camera(&self, request: &RegisterCameraRequest) -> Result<RegisterCameraResponse> {
+    pub async fn register_camera(&self, request: &RegisterCameraRequest) -> Result<RegisterCameraResponse> {
         self.backend.probe_camera(&request.camera)?;
         self.store.upsert_camera(&request.camera)?;
+
+        let recording = if let Some(start_recording) = &request.start_recording {
+            Some(
+                self.start_recording(&StartRecordingRequest {
+                    camera: request.camera.clone(),
+                    output_directory: start_recording.output_directory.clone(),
+                })
+                .await?,
+            )
+        } else {
+            None
+        };
 
         Ok(RegisterCameraResponse {
             camera_id: request.camera.id.0.clone(),
             backend: self.backend.name().to_string(),
+            recording,
         })
     }
 
@@ -208,6 +286,7 @@ impl<B: MediaBackend, S: CameraStore + RecordingSessionStore + RecordingSegmentS
                     session.state = RecordingState::Running;
                     session.pid = response.pid;
                     session.output_hint = response.output_hint.clone();
+                    session.last_error = response.last_error.clone();
                     session.updated_at_unix_ms = now_unix_ms();
                     self.store.upsert_session(&session)?;
                     if let Some(camera) = camera.as_ref() {
@@ -228,6 +307,47 @@ impl<B: MediaBackend, S: CameraStore + RecordingSessionStore + RecordingSegmentS
             }
         }
         Ok(response)
+    }
+
+    pub async fn start_analysis(&self, request: &StartAnalysisRequest) -> Result<StartAnalysisResponse> {
+        self.backend.probe_camera(&request.camera)?;
+        self.store.upsert_camera(&request.camera)?;
+        self.worker.start_analysis(request).await
+    }
+
+    pub async fn stop_analysis(&self, request: &StopAnalysisRequest) -> Result<StopAnalysisResponse> {
+        self.worker.stop_analysis(request).await
+    }
+
+    pub async fn analysis_status(&self, request: &AnalysisStatusRequest) -> Result<AnalysisStatusResponse> {
+        self.worker.analysis_status(request).await
+    }
+
+    pub async fn sync_analysis_events(
+        &self,
+        request: &SyncAnalysisEventsRequest,
+    ) -> Result<SyncAnalysisEventsResponse> {
+        let response = self.worker.pull_analysis_events(request).await?;
+        let stored_events = response.events.len();
+        let stored_artifacts = response
+            .events
+            .iter()
+            .map(|event| event.artifacts.len())
+            .sum();
+
+        for pending in response.events {
+            self.store.upsert_event(&pending.event)?;
+            for artifact in pending.artifacts {
+                self.store.upsert_event_artifact(&artifact)?;
+            }
+        }
+
+        Ok(SyncAnalysisEventsResponse {
+            camera_id: response.camera_id,
+            stored_events,
+            stored_artifacts,
+            last_event_at_unix_ms: response.last_event_at_unix_ms,
+        })
     }
 
     pub fn sync_recording_segments(&self, request: &SyncRecordingSegmentsRequest) -> Result<SyncRecordingSegmentsResponse> {
@@ -265,6 +385,58 @@ impl<B: MediaBackend, S: CameraStore + RecordingSessionStore + RecordingSegmentS
         self.store.retention_preview(request.retain_after_unix_ms)
     }
 
+    pub fn retention_cleanup(&self, request: &RetentionCleanupRequest) -> Result<RetentionCleanupResponse> {
+        self.store.retention_cleanup(request.retain_after_unix_ms)
+    }
+
+    pub fn artifact_retention_preview(
+        &self,
+        request: &ArtifactRetentionPreviewRequest,
+    ) -> Result<ArtifactRetentionPreviewResponse> {
+        self.store.artifact_retention_preview(request)
+    }
+
+    pub fn artifact_retention_cleanup(
+        &self,
+        request: &ArtifactRetentionCleanupRequest,
+    ) -> Result<ArtifactRetentionCleanupResponse> {
+        self.store.artifact_retention_cleanup(request)
+    }
+
+    pub fn create_surveillance_event(
+        &self,
+        request: &CreateSurveillanceEventRequest,
+    ) -> Result<CreateSurveillanceEventResponse> {
+        self.store.upsert_event(&request.event)?;
+        for artifact in &request.artifacts {
+            self.store.upsert_event_artifact(artifact)?;
+        }
+
+        Ok(CreateSurveillanceEventResponse {
+            event_id: request.event.id.0.clone(),
+            stored_artifacts: request.artifacts.len(),
+        })
+    }
+
+    pub fn list_surveillance_events(
+        &self,
+        request: &ListSurveillanceEventsRequest,
+    ) -> Result<ListSurveillanceEventsResponse> {
+        Ok(ListSurveillanceEventsResponse {
+            events: self.store.list_events(
+                request.camera_id.as_ref(),
+                request.occurred_after_unix_ms,
+                request.occurred_before_unix_ms,
+            )?,
+        })
+    }
+
+    pub fn list_event_artifacts(&self, request: &ListEventArtifactsRequest) -> Result<ListEventArtifactsResponse> {
+        Ok(ListEventArtifactsResponse {
+            artifacts: self.store.list_event_artifacts(&request.event_id)?,
+        })
+    }
+
     pub fn list_cameras(&self) -> Result<ListCamerasResponse> {
         Ok(ListCamerasResponse {
             cameras: self.store.list_cameras()?,
@@ -283,7 +455,12 @@ impl<B: MediaBackend, S: CameraStore + RecordingSessionStore + RecordingSegmentS
     }
 }
 
-impl<B: MediaBackend, S: CameraStore + RecordingSessionStore + RecordingSegmentStore, W: WorkerClient> ControlPlane<B, S, W> {
+impl<
+        B: MediaBackend,
+        S: CameraStore + RecordingSessionStore + RecordingSegmentStore + SurveillanceEventStore + EventArtifactStore,
+        W: WorkerClient,
+    > ControlPlane<B, S, W>
+{
     fn sync_segments_for_session(
         &self,
         camera: &Camera,
@@ -434,9 +611,11 @@ mod tests {
     use super::*;
     use std::fs;
     use harborlookout_domain::{
-        Camera, CameraId, CameraStream, RtspSource, RtspTransport, StreamProfile, StreamRole, WorkerState,
+        ArtifactId, ArtifactKind, Camera, CameraId, CameraStream, EventArtifact, EventId, EventKind,
+        EventSeverity, RtspSource, RtspTransport, StreamProfile, StreamRole, SurveillanceEvent,
+        WorkerState,
     };
-    use harborlookout_media_core::{MediaBackend, ProbeSummary, RecordingPlan};
+    use harborlookout_media_core::{MediaBackend, ProbeSummary, RecordingPlan, SnapshotPlan};
     use harborlookout_storage::SqliteCameraStore;
 
     #[derive(Debug, Clone, Default)]
@@ -504,6 +683,92 @@ mod tests {
                     state: WorkerState::Running,
                     pid: Some(4242),
                     output_hint: Some(format!("recordings/{}-%06d.mp4", request.camera_id.0)),
+                    exit_code: None,
+                    last_error: None,
+                })
+            })
+        }
+
+        fn start_analysis<'a>(
+            &'a self,
+            request: &'a StartAnalysisRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<StartAnalysisResponse>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(StartAnalysisResponse {
+                    camera_id: request.camera.id.0.clone(),
+                    worker_name: self.name().to_string(),
+                    state: WorkerState::Running,
+                    interval_ms: request.interval_ms,
+                    event_kind: request.event_kind.clone(),
+                    event_severity: request.event_severity.clone(),
+                    artifacts_directory: request.artifacts_directory.clone(),
+                    detector_program: request.detector.program.clone(),
+                })
+            })
+        }
+
+        fn stop_analysis<'a>(
+            &'a self,
+            request: &'a StopAnalysisRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<StopAnalysisResponse>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(StopAnalysisResponse {
+                    camera_id: request.camera_id.0.clone(),
+                    stopped: true,
+                })
+            })
+        }
+
+        fn analysis_status<'a>(
+            &'a self,
+            request: &'a AnalysisStatusRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<AnalysisStatusResponse>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(AnalysisStatusResponse {
+                    camera_id: request.camera_id.0.clone(),
+                    state: WorkerState::Running,
+                    event_kind: Some(EventKind::PackageDetected),
+                    event_severity: Some(EventSeverity::Warning),
+                    interval_ms: Some(1_000),
+                    detector_program: Some("test-detector".into()),
+                    emitted_events: 1,
+                    pending_events: 0,
+                    last_event_at_unix_ms: Some(1_000),
+                    last_error: None,
+                })
+            })
+        }
+
+        fn pull_analysis_events<'a>(
+            &'a self,
+            request: &'a SyncAnalysisEventsRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<PullAnalysisEventsResponse>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(PullAnalysisEventsResponse {
+                    camera_id: request.camera_id.0.clone(),
+                    events: vec![harborlookout_contracts::PendingAnalysisEvent {
+                        event: SurveillanceEvent {
+                            id: EventId(format!("analysis-{}-000001", request.camera_id.0)),
+                            camera_id: request.camera_id.clone(),
+                            kind: EventKind::PackageDetected,
+                            severity: EventSeverity::Warning,
+                            occurred_at_unix_ms: 1_000,
+                            message: format!("package detected by mock analysis for {}", request.camera_id.0),
+                        },
+                        artifacts: vec![EventArtifact {
+                            id: ArtifactId(format!("artifact-{}-000001", request.camera_id.0)),
+                            event_id: EventId(format!("analysis-{}-000001", request.camera_id.0)),
+                            camera_id: request.camera_id.clone(),
+                            kind: ArtifactKind::Keyframe,
+                            path: format!("artifacts/{}/analysis-000001.jpg", request.camera_id.0),
+                            mime_type: Some("image/jpeg".into()),
+                            created_at_unix_ms: 1_000,
+                            started_at_unix_ms: Some(1_000),
+                            ended_at_unix_ms: Some(1_000),
+                            size_bytes: 256,
+                        }],
+                    }],
+                    last_event_at_unix_ms: Some(1_000),
                 })
             })
         }
@@ -524,15 +789,23 @@ mod tests {
 
         fn build_recording_plan(&self, camera: &Camera, output_directory: &str) -> Result<RecordingPlan> {
             Ok(RecordingPlan {
-                program: "test-backend",
+                program: "test-backend".into(),
                 args: vec![camera.id.0.clone(), output_directory.to_string()],
                 output_hint: output_directory.to_string(),
             })
         }
+
+        fn build_snapshot_plan(&self, camera: &Camera, output_path: &str) -> Result<SnapshotPlan> {
+            Ok(SnapshotPlan {
+                program: "test-backend".into(),
+                args: vec![camera.id.0.clone(), output_path.to_string()],
+                output_path: output_path.to_string(),
+            })
+        }
     }
 
-    #[test]
-    fn registers_camera() {
+    #[tokio::test]
+    async fn registers_camera() {
         let control_plane = ControlPlane::new(TestBackend, SqliteCameraStore::open(":memory:").unwrap(), TestWorker);
         let request = RegisterCameraRequest {
             camera: Camera {
@@ -563,13 +836,59 @@ mod tests {
                 },
                 enabled: true,
             },
+            start_recording: None,
         };
 
-        let response = control_plane.register_camera(&request).unwrap();
+        let response = control_plane.register_camera(&request).await.unwrap();
         assert_eq!(response.camera_id, "cam-lobby");
+        assert!(response.recording.is_none());
         assert_eq!(control_plane.health().unwrap().registered_cameras, 1);
         assert_eq!(control_plane.health().unwrap().active_recordings, 0);
         assert_eq!(control_plane.list_cameras().unwrap().cameras.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn registers_camera_and_starts_recording_when_requested() {
+        let store = SqliteCameraStore::open(":memory:").unwrap();
+        let control_plane = ControlPlane::new(TestBackend, store, TestWorker);
+        let request = RegisterCameraRequest {
+            camera: Camera {
+                id: CameraId("cam-register-start".into()),
+                name: "Register Start".into(),
+                streams: vec![CameraStream {
+                    role: StreamRole::Record,
+                    source: RtspSource {
+                        url: "rtsp://camera.local/register-start".into(),
+                        transport: RtspTransport::Tcp,
+                    },
+                    stream_profile: StreamProfile {
+                        width: 1280,
+                        height: 720,
+                        fps: 15,
+                        segment_seconds: 10,
+                    },
+                }],
+                source: RtspSource {
+                    url: "rtsp://camera.local/register-start".into(),
+                    transport: RtspTransport::Tcp,
+                },
+                stream_profile: StreamProfile {
+                    width: 1280,
+                    height: 720,
+                    fps: 15,
+                    segment_seconds: 10,
+                },
+                enabled: true,
+            },
+            start_recording: Some(harborlookout_contracts::RegisterCameraRecordingRequest {
+                output_directory: "recordings/register-start".into(),
+            }),
+        };
+
+        let response = control_plane.register_camera(&request).await.unwrap();
+        assert_eq!(response.camera_id, "cam-register-start");
+        assert_eq!(response.recording.as_ref().map(|recording| recording.pid), Some(4242));
+        assert_eq!(control_plane.health().unwrap().active_recordings, 1);
     }
 
     #[test]
@@ -668,6 +987,38 @@ mod tests {
         assert_eq!(control_plane.health().unwrap().active_recordings, 1);
     }
 
+    #[tokio::test]
+    async fn syncs_analysis_events_into_storage() {
+        let store = SqliteCameraStore::open(":memory:").unwrap();
+        let control_plane = ControlPlane::new(TestBackend, store, TestWorker);
+        let response = control_plane
+            .sync_analysis_events(&SyncAnalysisEventsRequest {
+                camera_id: CameraId("cam-analysis".into()),
+                max_events: Some(4),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.stored_events, 1);
+        assert_eq!(response.stored_artifacts, 1);
+
+        let events = control_plane
+            .list_surveillance_events(&ListSurveillanceEventsRequest {
+                camera_id: Some(CameraId("cam-analysis".into())),
+                occurred_after_unix_ms: None,
+                occurred_before_unix_ms: None,
+            })
+            .unwrap();
+        assert_eq!(events.events.len(), 1);
+
+        let artifacts = control_plane
+            .list_event_artifacts(&ListEventArtifactsRequest {
+                event_id: EventId("analysis-cam-analysis-000001".into()),
+            })
+            .unwrap();
+        assert_eq!(artifacts.artifacts.len(), 1);
+    }
+
     #[test]
     fn reports_storage_summary() {
         let store = SqliteCameraStore::open(":memory:").unwrap();
@@ -696,6 +1047,81 @@ mod tests {
             .unwrap();
         assert_eq!(preview.reclaimable_segments, 1);
         assert_eq!(preview.reclaimable_bytes, 64);
+
+        let cleanup = control_plane
+            .retention_cleanup(&RetentionCleanupRequest {
+                retain_after_unix_ms: 100,
+            })
+            .unwrap();
+        assert_eq!(cleanup.deleted_segments, 1);
+        assert_eq!(cleanup.deleted_bytes, 64);
+
+        let artifact_preview = control_plane
+            .artifact_retention_preview(&ArtifactRetentionPreviewRequest {
+                retain_after_unix_ms: u64::MAX,
+                retain_after_by_kind: Vec::new(),
+                protect_events_occurred_after_unix_ms: None,
+            })
+            .unwrap();
+        assert_eq!(artifact_preview.reclaimable_artifacts, 0);
+
+        let artifact_cleanup = control_plane
+            .artifact_retention_cleanup(&ArtifactRetentionCleanupRequest {
+                retain_after_unix_ms: u64::MAX,
+                retain_after_by_kind: Vec::new(),
+                protect_events_occurred_after_unix_ms: None,
+            })
+            .unwrap();
+        assert_eq!(artifact_cleanup.deleted_artifacts, 0);
+    }
+
+    #[test]
+    fn creates_and_lists_surveillance_events() {
+        let store = SqliteCameraStore::open(":memory:").unwrap();
+        let control_plane = ControlPlane::new(TestBackend, store, TestWorker);
+        let request = CreateSurveillanceEventRequest {
+            event: SurveillanceEvent {
+                id: EventId("event-garage-1".into()),
+                camera_id: CameraId("cam-garage".into()),
+                kind: EventKind::PackageDetected,
+                severity: EventSeverity::Warning,
+                occurred_at_unix_ms: 1_000,
+                message: "package detected near garage door".into(),
+            },
+            artifacts: vec![EventArtifact {
+                id: ArtifactId("artifact-garage-1".into()),
+                event_id: EventId("event-garage-1".into()),
+                camera_id: CameraId("cam-garage".into()),
+                kind: ArtifactKind::Keyframe,
+                path: "artifacts/event-garage-1/frame.jpg".into(),
+                mime_type: Some("image/jpeg".into()),
+                created_at_unix_ms: 1_005,
+                started_at_unix_ms: Some(1_000),
+                ended_at_unix_ms: Some(1_005),
+                size_bytes: 512,
+            }],
+        };
+
+        let created = control_plane.create_surveillance_event(&request).unwrap();
+        assert_eq!(created.event_id, "event-garage-1");
+        assert_eq!(created.stored_artifacts, 1);
+
+        let events = control_plane
+            .list_surveillance_events(&ListSurveillanceEventsRequest {
+                camera_id: Some(CameraId("cam-garage".into())),
+                occurred_after_unix_ms: Some(500),
+                occurred_before_unix_ms: Some(2_000),
+            })
+            .unwrap();
+        assert_eq!(events.events.len(), 1);
+
+        let artifacts = control_plane
+            .list_event_artifacts(&ListEventArtifactsRequest {
+                event_id: EventId("event-garage-1".into()),
+            })
+            .unwrap();
+        assert_eq!(artifacts.artifacts.len(), 1);
+        assert_eq!(artifacts.artifacts[0].kind, ArtifactKind::Keyframe);
     }
 
     #[test]

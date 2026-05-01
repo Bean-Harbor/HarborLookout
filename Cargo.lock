@@ -183,6 +183,12 @@ dependencies = [
 name = "harborlookout-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "harborlookout-contracts",
+ "harborlookout-domain",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -210,6 +216,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "harborlookout-detector-adapter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "harborlookout-domain",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harborlookout-domain"
 version = "0.1.0"
 dependencies = [
@@ -232,6 +248,26 @@ dependencies = [
  "anyhow",
  "harborlookout-domain",
  "harborlookout-media-core",
+]
+
+[[package]]
+name = "harborlookout-model-runner-example"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "harborlookout-domain",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "harborlookout-model-runner-yolo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "harborlookout-domain",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -273,6 +309,7 @@ dependencies = [
  "harborlookout-domain",
  "harborlookout-media-core",
  "harborlookout-media-ffmpeg",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

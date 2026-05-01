@@ -167,12 +167,12 @@ Exit criteria:
 
 ## Near-Term Backlog
 
-1. Persist recording segments, events, and event artifacts in SQLite.
-2. Wire server-to-worker execution instead of exposing disconnected binaries.
-3. Add worker status and failure reporting.
-4. Introduce multi-stream camera models for detect and record roles.
-5. Design enrichment job contracts before choosing the first local VLM.
-6. Define the first searchable event schema and answer format.
+1. Replace the heuristic detector adapter with a model-backed local detector.
+2. Design enrichment job contracts before choosing the first local VLM.
+3. Define the first searchable event schema and answer format.
+4. Harden artifact retention with event-link safety rules and tiered policies.
+5. Add event-to-recording and event-to-clip linking conventions.
+6. Decide whether event ingestion stays server-local or gets a dedicated analysis service boundary.
 
 ## Tracking Notes
 

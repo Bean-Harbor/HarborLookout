@@ -56,7 +56,7 @@ Status: in progress
       start, stop, restart, status.
 - [x] Add contracts for recording segment queries by camera and time range.
 - [x] Add contracts for retention and storage summary responses.
-- [ ] Keep request and response shapes stable enough for future HarborOS merge.
+- [x] Keep request and response shapes stable enough for future HarborOS merge.
 
 Definition of done:
 
@@ -118,7 +118,7 @@ Status: in progress
 
 - [x] Extend the control plane from camera CRUD into orchestration logic.
 - [x] Add worker client integration points instead of local-only probe actions.
-- [ ] Register cameras without auto-start side effects unless explicitly
+- [x] Register cameras without auto-start side effects unless explicitly
       requested.
 - [x] Add operations for start recording, stop recording, restart recording, and
       fetch recording status.
@@ -144,7 +144,7 @@ Status: in progress
       registry.
 - [x] Track spawned FFmpeg processes by camera or session id.
 - [x] Add stop and status endpoints.
-- [ ] Report failed spawns and exited processes clearly.
+- [x] Report failed spawns and exited processes clearly.
 - [x] Ensure worker startup creates required recording directories.
 - [x] Decide whether the worker or server is authoritative for session state,
       then implement consistently.
@@ -163,11 +163,12 @@ Definition of done:
 Status: in progress
 
 - [x] Add a worker client for HTTP calls to the worker service.
-- [ ] Wire camera registration to optional recording start flows.
+- [x] Wire camera registration to optional recording start flows.
 - [x] Add endpoints for start, stop, restart, and status.
 - [x] Add endpoints to list recording segments by camera and time range.
 - [x] Add endpoints for storage summary and retention preview if feasible in
       Phase 1.
+- [x] Add retention cleanup execution for non-running segments.
 - [x] Keep API errors explicit so setup and worker failures are debuggable.
 
 Additional progress:
@@ -182,9 +183,9 @@ Definition of done:
 
 ### apps/cli
 
-Status: pending
+Status: in progress
 
-- [ ] Add smoke commands for camera probe, camera register, recording start,
+- [x] Add smoke commands for camera probe, camera register, recording start,
       recording stop, and segment list.
 - [ ] Keep CLI focused on operator diagnostics, not full product workflows.
 
@@ -211,15 +212,20 @@ Definition of done:
 Current smoke coverage:
 
 - register camera
+- list cameras
+- probe camera recording plan
 - start recording
+- restart recording
 - fetch running status
 - manual segment sync
 - query indexed segments
 - stop recording
+- inspect storage summary and retention preview
+- execute retention cleanup
 
 ### Documentation
 
-- [ ] Update README once Phase 1 endpoints and flows are stable.
+- [x] Update README once Phase 1 endpoints and flows are stable.
 - [x] Record implementation milestones in `docs/work_log.md`.
 - [x] Update this checklist as items move from pending to done.
 

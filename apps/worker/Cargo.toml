@@ -12,6 +12,7 @@ harborlookout-contracts = { path = "../../crates/contracts" }
 harborlookout-domain = { path = "../../crates/domain" }
 harborlookout-media-core = { path = "../../crates/media-core" }
 harborlookout-media-ffmpeg = { path = "../../crates/media-ffmpeg" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

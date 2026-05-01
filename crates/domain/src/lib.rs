@@ -9,6 +9,9 @@ pub struct CameraId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct EventId(pub String);
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ArtifactId(pub String);
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RtspTransport {
     Tcp,
@@ -92,10 +95,39 @@ pub struct RecordingSession {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EventKind {
     MotionDetected,
+    MotionInZone,
+    PersonDetected,
+    VehicleDetected,
+    PetDetected,
+    PackageDetected,
+    DrinkContainerDetected,
+    ObjectRemoved,
+    SpillCandidateDetected,
     RecordingStarted,
     RecordingStopped,
     CameraOffline,
     CameraOnline,
+}
+
+impl EventKind {
+    pub fn is_analysis_event(&self) -> bool {
+        matches!(
+            self,
+            Self::MotionDetected
+                | Self::MotionInZone
+                | Self::PersonDetected
+                | Self::VehicleDetected
+                | Self::PetDetected
+                | Self::PackageDetected
+                | Self::DrinkContainerDetected
+                | Self::ObjectRemoved
+                | Self::SpillCandidateDetected
+        )
+    }
+
+    pub fn is_system_event(&self) -> bool {
+        !self.is_analysis_event()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,6 +135,14 @@ pub enum EventSeverity {
     Info,
     Warning,
     Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArtifactKind {
+    Keyframe,
+    Clip,
+    Thumbnail,
+    Metadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,6 +153,20 @@ pub struct SurveillanceEvent {
     pub severity: EventSeverity,
     pub occurred_at_unix_ms: u64,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventArtifact {
+    pub id: ArtifactId,
+    pub event_id: EventId,
+    pub camera_id: CameraId,
+    pub kind: ArtifactKind,
+    pub path: String,
+    pub mime_type: Option<String>,
+    pub created_at_unix_ms: u64,
+    pub started_at_unix_ms: Option<u64>,
+    pub ended_at_unix_ms: Option<u64>,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,5 +395,34 @@ mod tests {
 
         assert_eq!(segment.state, RecordingState::Completed);
         assert_eq!(segment.ended_at_unix_ms, Some(1_744_000_010_000));
+    }
+
+    #[test]
+    fn event_artifact_supports_optional_time_bounds() {
+        let artifact = EventArtifact {
+            id: ArtifactId("artifact-1".into()),
+            event_id: EventId("event-1".into()),
+            camera_id: CameraId("cam-front-door".into()),
+            kind: ArtifactKind::Clip,
+            path: "artifacts/event-1/clip.mp4".into(),
+            mime_type: Some("video/mp4".into()),
+            created_at_unix_ms: 1_000,
+            started_at_unix_ms: Some(900),
+            ended_at_unix_ms: Some(1_100),
+            size_bytes: 2_048,
+        };
+
+        assert_eq!(artifact.kind, ArtifactKind::Clip);
+        assert_eq!(artifact.started_at_unix_ms, Some(900));
+        assert_eq!(artifact.ended_at_unix_ms, Some(1_100));
+    }
+
+    #[test]
+    fn distinguishes_analysis_and_system_event_kinds() {
+        assert!(EventKind::PackageDetected.is_analysis_event());
+        assert!(EventKind::MotionInZone.is_analysis_event());
+        assert!(!EventKind::RecordingStarted.is_analysis_event());
+        assert!(EventKind::RecordingStarted.is_system_event());
+        assert!(!EventKind::PackageDetected.is_system_event());
     }
 }
