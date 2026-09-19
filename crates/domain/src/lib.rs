@@ -92,6 +92,60 @@ pub struct RecordingSession {
     pub last_error: Option<String>,
 }
 
+/// Opaque lease for an externally managed recording target.
+///
+/// HarborOS owns media enumeration, mounting and byte I/O. HarborLookout
+/// receives only this lease metadata; it must never be given a mount point,
+/// `/dev` node or arbitrary output directory for an external target.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ExternalRecordingLease {
+    #[serde(alias = "lease_id")]
+    pub lease_id: String,
+    #[serde(alias = "slot_id")]
+    pub slot_id: String,
+    #[serde(alias = "source_token", alias = "source_ref")]
+    pub source_token: String,
+    #[serde(alias = "expires_at_unix_ms", alias = "expires_at")]
+    pub expires_at_unix_ms: u64,
+}
+
+impl ExternalRecordingLease {
+    pub fn validate(&self, now_unix_ms: u64) -> Result<(), DomainError> {
+        if self.lease_id.trim().is_empty()
+            || self.slot_id.trim().is_empty()
+            || self.source_token.trim().is_empty()
+        {
+            return Err(DomainError::InvalidExternalRecordingLease(
+                "lease fields must be non-empty",
+            ));
+        }
+        if self.slot_id != "TF-1" {
+            return Err(DomainError::InvalidExternalRecordingLease(
+                "external recording is supported only on TF-1",
+            ));
+        }
+        if self.expires_at_unix_ms <= now_unix_ms {
+            return Err(DomainError::ExternalRecordingLeaseExpired);
+        }
+        for value in [&self.lease_id, &self.slot_id, &self.source_token] {
+            if value.chars().any(char::is_control)
+                || value.chars().any(char::is_whitespace)
+                || value.contains('/')
+                || value.contains('\\')
+                || value.contains('?')
+                || value.contains('#')
+            {
+                return Err(DomainError::InvalidExternalRecordingLease(
+                    "lease identifiers must be opaque and path-safe",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EventKind {
     MotionDetected,
@@ -202,6 +256,10 @@ pub enum DomainError {
     InvalidSegmentDuration,
     #[error("duplicate stream role configured: {0:?}")]
     DuplicateStreamRole(StreamRole),
+    #[error("invalid external recording lease: {0}")]
+    InvalidExternalRecordingLease(&'static str),
+    #[error("external recording lease has expired")]
+    ExternalRecordingLeaseExpired,
 }
 
 impl Camera {
@@ -395,6 +453,36 @@ mod tests {
 
         assert_eq!(segment.state, RecordingState::Completed);
         assert_eq!(segment.ended_at_unix_ms, Some(1_744_000_010_000));
+    }
+
+    #[test]
+    fn external_recording_lease_is_tf_only_and_opaque() {
+        let lease = ExternalRecordingLease {
+            lease_id: "lease-tf-1".into(),
+            slot_id: "TF-1".into(),
+            source_token: "recording-token-1".into(),
+            expires_at_unix_ms: 2_000,
+        };
+        assert!(lease.validate(1_000).is_ok());
+
+        let mut usb3 = lease.clone();
+        usb3.slot_id = "USB-A1".into();
+        assert!(matches!(
+            usb3.validate(1_000),
+            Err(DomainError::InvalidExternalRecordingLease(_))
+        ));
+
+        let mut path_like = lease.clone();
+        path_like.source_token = "/data/removable".into();
+        assert!(matches!(
+            path_like.validate(1_000),
+            Err(DomainError::InvalidExternalRecordingLease(_))
+        ));
+
+        assert!(matches!(
+            lease.validate(2_000),
+            Err(DomainError::ExternalRecordingLeaseExpired)
+        ));
     }
 
     #[test]

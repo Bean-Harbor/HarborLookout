@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -16,17 +16,24 @@ use harborlookout_contracts::{
     RecordingStatusResponse, RestartRecordingRequest, RestartRecordingResponse, StartAnalysisRequest,
     StartAnalysisResponse, StartRecordingRequest, StartRecordingResponse, StopAnalysisRequest,
     StopAnalysisResponse, StopRecordingRequest, StopRecordingResponse, SyncAnalysisEventsRequest,
+    RecordingWriterSegmentCompleteRequest, RecordingWriterSegmentStartRequest,
+    RecordingWriterSegmentWriteRequest,
 };
 use harborlookout_domain::{
     ArtifactId, ArtifactKind, EventId, SurveillanceEvent, WorkerState as RecordingWorkerState,
 };
 use harborlookout_media_ffmpeg::FfmpegBackend;
 use harborlookout_media_core::MediaBackend;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 use tracing::info;
+
+mod recording_writer;
 
 struct ManagedRecording {
     pid: u32,
@@ -34,6 +41,13 @@ struct ManagedRecording {
     child: Child,
     last_exit_code: Option<i32>,
     last_error: Option<String>,
+}
+
+struct ManagedExternalRecording {
+    pid: u32,
+    output_hint: String,
+    stop: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<()>>,
 }
 
 struct ManagedAnalysis {
@@ -55,6 +69,7 @@ struct ManagedAnalysis {
 struct WorkerAppState {
     backend: FfmpegBackend,
     sessions: Arc<Mutex<HashMap<String, ManagedRecording>>>,
+    external_sessions: Arc<Mutex<HashMap<String, ManagedExternalRecording>>>,
     analyses: Arc<Mutex<HashMap<String, ManagedAnalysis>>>,
 }
 
@@ -65,6 +80,7 @@ async fn main() -> Result<()> {
     let state = WorkerAppState {
         backend: FfmpegBackend,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        external_sessions: Arc::new(Mutex::new(HashMap::new())),
         analyses: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -117,10 +133,183 @@ async fn build_recording_plan(
     }))
 }
 
+async fn start_external_recording(
+    State(state): State<WorkerAppState>,
+    camera: harborlookout_domain::Camera,
+    lease: harborlookout_domain::ExternalRecordingLease,
+) -> Result<Json<StartRecordingResponse>, (StatusCode, String)> {
+    lease
+        .validate(now_unix_ms())
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let camera_id = camera.id.0.clone();
+    ensure_not_running(&state, &camera_id).await?;
+
+    let socket_path = std::env::var("HARBOROS_RECORDING_WRITER_SOCKET")
+        .unwrap_or_else(|_| "/run/harboros/recording-writer.sock".to_string());
+    let client = recording_writer::RecordingWriterClient::new(socket_path);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let backend = state.backend.clone();
+    let task_camera = camera.clone();
+    let task_lease = lease.clone();
+    let task = tokio::spawn(async move {
+        run_external_recording(&backend, &task_camera, &task_lease, client, stop_rx, ready_tx).await
+    });
+    let (program, args, output_hint, pid) = ready_rx.await.map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "external recording failed before the first segment started".to_string(),
+        )
+    })?;
+    state.external_sessions.lock().await.insert(
+        camera_id.clone(),
+        ManagedExternalRecording {
+            pid,
+            output_hint: output_hint.clone(),
+            stop: Some(stop_tx),
+            task,
+        },
+    );
+    Ok(Json(StartRecordingResponse {
+        backend: "ffmpeg".into(),
+        program,
+        args,
+        output_hint,
+        pid,
+    }))
+}
+
+async fn run_external_recording(
+    backend: &FfmpegBackend,
+    camera: &harborlookout_domain::Camera,
+    lease: &harborlookout_domain::ExternalRecordingLease,
+    client: recording_writer::RecordingWriterClient,
+    mut stop_rx: oneshot::Receiver<()>,
+    ready_tx: oneshot::Sender<(String, Vec<String>, String, u32)>,
+) -> Result<()> {
+    client
+        .resolve(format!("lookout-resolve-{}", now_unix_ms()), lease.source_token.clone())
+        .await?;
+    let mut ready_tx = Some(ready_tx);
+    let safe_camera_id = camera
+        .id
+        .0
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() || character == '-' || character == '_' { character } else { '-' })
+        .collect::<String>();
+    for sequence in 0u64.. {
+        client
+            .renew(format!("lookout-renew-{sequence}-{}", now_unix_ms()), lease.source_token.clone())
+            .await?;
+        let plan = backend.build_external_segment_plan(camera)?;
+        let mut command = Command::new(&plan.program);
+        command
+            .args(&plan.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command.spawn()?;
+        let pid = child.id().ok_or_else(|| anyhow::anyhow!("external ffmpeg process has no pid"))?;
+        let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("external ffmpeg stdout is unavailable"))?;
+        let segment_id = format!("external-{safe_camera_id}-{sequence}");
+        if let Err(error) = client
+            .start(
+                format!("lookout-start-{sequence}-{}", now_unix_ms()),
+                RecordingWriterSegmentStartRequest {
+                    lease_ref: lease.source_token.clone(),
+                    segment_id: segment_id.clone(),
+                    sequence,
+                    started_at: None,
+                },
+            )
+            .await
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
+        }
+        if let Some(sender) = ready_tx.take() {
+            let _ = sender.send((plan.program.clone(), plan.args.clone(), plan.output_hint.clone(), pid));
+        }
+        let mut digest = Sha256::new();
+        let mut bytes_done = 0u64;
+        let mut buffer = vec![0u8; 768 * 1024];
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let _ = client.complete(
+                        format!("lookout-interrupted-{sequence}-{}", now_unix_ms()),
+                        RecordingWriterSegmentCompleteRequest {
+                            lease_ref: lease.source_token.clone(),
+                            segment_id: segment_id.clone(),
+                            state: "interrupted".into(),
+                            bytes_done: Some(bytes_done),
+                            hash_sha256: Some(digest_hex(&digest)),
+                            error_code: Some("RECORDING_STOPPED".into()),
+                        },
+                    ).await;
+                    return Ok(());
+                }
+                read = stdout.read(&mut buffer) => {
+                    let count = read?;
+                    if count == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..count]);
+                    bytes_done = bytes_done.saturating_add(count as u64);
+                    client.write(
+                        format!("lookout-write-{sequence}-{bytes_done}"),
+                        RecordingWriterSegmentWriteRequest {
+                            lease_ref: lease.source_token.clone(),
+                            segment_id: segment_id.clone(),
+                            chunk_base64: BASE64.encode(&buffer[..count]),
+                        },
+                    ).await?;
+                }
+            }
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            let _ = client.complete(
+                format!("lookout-failed-{sequence}-{}", now_unix_ms()),
+                RecordingWriterSegmentCompleteRequest {
+                    lease_ref: lease.source_token.clone(),
+                    segment_id,
+                    state: "failed".into(),
+                    bytes_done: Some(bytes_done),
+                    hash_sha256: Some(digest_hex(&digest)),
+                    error_code: Some("FFMPEG_EXIT_FAILED".into()),
+                },
+            ).await;
+            bail!("external ffmpeg exited unsuccessfully");
+        }
+        client
+            .complete(
+                format!("lookout-complete-{sequence}-{}", now_unix_ms()),
+                RecordingWriterSegmentCompleteRequest {
+                    lease_ref: lease.source_token.clone(),
+                    segment_id,
+                    state: "sealed".into(),
+                    bytes_done: Some(bytes_done),
+                    hash_sha256: Some(digest_hex(&digest)),
+                    error_code: None,
+                },
+            )
+            .await?;
+    }
+    unreachable!()
+}
+
 async fn start_recording(
     State(state): State<WorkerAppState>,
     Json(request): Json<StartRecordingRequest>,
 ) -> Result<Json<StartRecordingResponse>, (StatusCode, String)> {
+    if let Some(lease) = request.external_recording_lease.clone() {
+        return start_external_recording(State(state), request.camera, lease).await;
+    }
+    reject_external_recording_lease(request.external_recording_lease.as_ref())?;
     let camera_id = request.camera.id.0.clone();
     ensure_not_running(&state, &camera_id).await?;
 
@@ -175,6 +364,16 @@ async fn stop_recording(
     State(state): State<WorkerAppState>,
     Json(request): Json<StopRecordingRequest>,
 ) -> Result<Json<StopRecordingResponse>, (StatusCode, String)> {
+    if let Some(mut managed) = state.external_sessions.lock().await.remove(&request.camera_id.0) {
+        if let Some(stop) = managed.stop.take() {
+            let _ = stop.send(());
+        }
+        let _ = managed.task.await;
+        return Ok(Json(StopRecordingResponse {
+            camera_id: request.camera_id.0,
+            stopped: true,
+        }));
+    }
     let mut sessions = state.sessions.lock().await;
     let Some(mut managed) = sessions.remove(&request.camera_id.0) else {
         return Ok(Json(StopRecordingResponse {
@@ -199,6 +398,21 @@ async fn restart_recording(
     State(state): State<WorkerAppState>,
     Json(request): Json<RestartRecordingRequest>,
 ) -> Result<Json<RestartRecordingResponse>, (StatusCode, String)> {
+    if let Some(lease) = request.external_recording_lease.clone() {
+        let stop_request = StopRecordingRequest { camera_id: request.camera.id.clone() };
+        let _ = stop_recording(State(state.clone()), Json(stop_request)).await?;
+        let start_response = start_external_recording(State(state.clone()), request.camera.clone(), lease).await?.0;
+        return Ok(Json(RestartRecordingResponse {
+            camera_id: request.camera.id.0,
+            restarted: true,
+            backend: start_response.backend,
+            program: start_response.program,
+            args: start_response.args,
+            output_hint: start_response.output_hint,
+            pid: start_response.pid,
+        }));
+    }
+    reject_external_recording_lease(request.external_recording_lease.as_ref())?;
     let stop_request = StopRecordingRequest {
         camera_id: request.camera.id.clone(),
     };
@@ -209,6 +423,7 @@ async fn restart_recording(
         Json(StartRecordingRequest {
             camera: request.camera.clone(),
             output_directory: request.output_directory.clone(),
+            external_recording_lease: request.external_recording_lease.clone(),
         }),
     )
     .await?
@@ -229,6 +444,40 @@ async fn recording_status(
     State(state): State<WorkerAppState>,
     Json(request): Json<RecordingStatusRequest>,
 ) -> Result<Json<RecordingStatusResponse>, (StatusCode, String)> {
+    let mut external_sessions = state.external_sessions.lock().await;
+    if external_sessions.contains_key(&request.camera_id.0) {
+        let finished = external_sessions
+            .get(&request.camera_id.0)
+            .map(|managed| managed.task.is_finished())
+            .unwrap_or(false);
+        if finished {
+            let managed = external_sessions.remove(&request.camera_id.0).expect("external session exists");
+            let result = managed.task.await;
+            let (state_value, last_error) = match result {
+                Ok(Ok(())) => (RecordingWorkerState::Stopped, None),
+                Ok(Err(error)) => (RecordingWorkerState::Failed, Some(error.to_string())),
+                Err(error) => (RecordingWorkerState::Failed, Some(error.to_string())),
+            };
+            return Ok(Json(RecordingStatusResponse {
+                camera_id: request.camera_id.0,
+                state: state_value,
+                pid: Some(managed.pid),
+                output_hint: Some(managed.output_hint),
+                exit_code: None,
+                last_error,
+            }));
+        }
+        let managed = external_sessions.get(&request.camera_id.0).expect("external session exists");
+        return Ok(Json(RecordingStatusResponse {
+            camera_id: request.camera_id.0,
+            state: RecordingWorkerState::Running,
+            pid: Some(managed.pid),
+            output_hint: Some(managed.output_hint.clone()),
+            exit_code: None,
+            last_error: None,
+        }));
+    }
+    drop(external_sessions);
     let mut sessions = state.sessions.lock().await;
     let Some(managed) = sessions.get_mut(&request.camera_id.0) else {
         return Ok(Json(RecordingStatusResponse {
@@ -399,6 +648,12 @@ async fn pull_analysis_events(
 }
 
 async fn ensure_not_running(state: &WorkerAppState, camera_id: &str) -> Result<(), (StatusCode, String)> {
+    if state.external_sessions.lock().await.contains_key(camera_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("camera {camera_id} is already recording"),
+        ));
+    }
     let mut sessions = state.sessions.lock().await;
     let mut remove_stale = false;
 
@@ -421,6 +676,21 @@ async fn ensure_not_running(state: &WorkerAppState, camera_id: &str) -> Result<(
 
 fn bad_request(error: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, error.to_string())
+}
+
+fn reject_external_recording_lease(
+    lease: Option<&harborlookout_domain::ExternalRecordingLease>,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(lease) = lease {
+        lease
+            .validate(now_unix_ms())
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "external recording lease requires the HarborOS-owned recording writer".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn internal_error(error: std::io::Error) -> (StatusCode, String) {
@@ -629,6 +899,8 @@ struct DetectorResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harborlookout_contracts::StartRecordingRequest;
+    use harborlookout_domain::{Camera, CameraId, ExternalRecordingLease, RtspSource, RtspTransport, StreamProfile};
 
     #[test]
     fn describes_failed_exit_with_numeric_code() {
@@ -686,4 +958,49 @@ mod tests {
         assert!(parsed.detected);
         assert_eq!(parsed.message.as_deref(), Some("package detected"));
     }
+
+    #[tokio::test]
+    async fn external_recording_fails_closed_when_writer_is_unavailable() {
+        let state = WorkerAppState {
+            backend: FfmpegBackend,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            external_sessions: Arc::new(Mutex::new(HashMap::new())),
+            analyses: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let request = StartRecordingRequest {
+            camera: Camera {
+                id: CameraId("cam-external".into()),
+                name: "External target".into(),
+                streams: Vec::new(),
+                source: RtspSource {
+                    url: "rtsp://camera.local/external".into(),
+                    transport: RtspTransport::Tcp,
+                },
+                stream_profile: StreamProfile {
+                    width: 1280,
+                    height: 720,
+                    fps: 15,
+                    segment_seconds: 10,
+                },
+                enabled: true,
+            },
+            output_directory: "should-never-be-used".into(),
+            external_recording_lease: Some(ExternalRecordingLease {
+                lease_id: "lease-tf-1".into(),
+                slot_id: "TF-1".into(),
+                source_token: "opaque-source-token".into(),
+                expires_at_unix_ms: now_unix_ms() + 60_000,
+            }),
+        };
+
+        let result = start_recording(State(state.clone()), Json(request)).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        assert!(error.1.contains("external recording failed"));
+        assert!(state.sessions.lock().await.is_empty());
+    }
+}
+
+fn digest_hex(digest: &Sha256) -> String {
+    format!("{:x}", digest.clone().finalize())
 }

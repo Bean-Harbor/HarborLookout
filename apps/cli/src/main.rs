@@ -168,7 +168,10 @@ async fn execute(cli: Cli) -> Result<()> {
                 &RegisterCameraRequest {
                     camera,
                     start_recording: start_recording_output_directory.clone().map(
-                        |output_directory| RegisterCameraRecordingRequest { output_directory },
+                        |output_directory| RegisterCameraRecordingRequest {
+                            output_directory,
+                            external_recording_lease: None,
+                        },
                     ),
                 },
             )
@@ -204,6 +207,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 &StartRecordingRequest {
                     camera,
                     output_directory: output_directory.clone(),
+                    external_recording_lease: None,
                 },
             )
             .await
@@ -233,6 +237,7 @@ async fn execute(cli: Cli) -> Result<()> {
                 &harborlookout_contracts::RestartRecordingRequest {
                     camera,
                     output_directory: output_directory.clone(),
+                    external_recording_lease: None,
                 },
             )
             .await
