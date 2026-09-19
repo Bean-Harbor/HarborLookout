@@ -888,6 +888,10 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn digest_hex(digest: &Sha256) -> String {
+    format!("{:x}", digest.clone().finalize())
+}
+
 #[derive(Debug, Deserialize)]
 struct DetectorResult {
     detected: bool,
@@ -999,8 +1003,4 @@ mod tests {
         assert!(error.1.contains("external recording failed"));
         assert!(state.sessions.lock().await.is_empty());
     }
-}
-
-fn digest_hex(digest: &Sha256) -> String {
-    format!("{:x}", digest.clone().finalize())
 }

@@ -87,7 +87,7 @@ impl RecordingWriterSegmentWriteRequest {
                         | b'='
                 )
             })
-            || self.chunk_base64.len() % 4 != 0
+            || !self.chunk_base64.len().is_multiple_of(4)
         {
             return Err("chunk_base64 must be padded ASCII base64");
         }

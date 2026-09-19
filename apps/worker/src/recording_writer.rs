@@ -189,6 +189,54 @@ impl RecordingWriterClient {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use serde_json::{Value, json};
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
+
+    #[cfg(unix)]
+    fn test_socket_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "harborlookout-writer-{label}-{}-{nonce}.sock",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    async fn spawn_response_server(
+        label: &str,
+        declared_length: u32,
+        response: Vec<u8>,
+    ) -> (PathBuf, tokio::task::JoinHandle<()>) {
+        let path = test_socket_path(label);
+        let listener = UnixListener::bind(&path).unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request_length = stream.read_u32().await.unwrap() as usize;
+            assert!(request_length > 0 && request_length <= MAX_FRAME_BYTES);
+            let mut request_bytes = vec![0; request_length];
+            stream.read_exact(&mut request_bytes).await.unwrap();
+            let request: Value = serde_json::from_slice(&request_bytes).unwrap();
+            assert_eq!(request["schema"], HARBOROS_RECORDING_WRITER_SCHEMA);
+            assert_eq!(request["request_id"], "request-1");
+            assert_eq!(request["operation"], "resolve");
+            let encoded = String::from_utf8(request_bytes).unwrap();
+            assert!(!encoded.contains("output_directory"));
+            assert!(!encoded.contains("/dev/"));
+            stream.write_u32(declared_length).await.unwrap();
+            if !response.is_empty() {
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+        (path, task)
+    }
+
     #[test]
     fn client_has_no_path_bearing_writer_payload() {
         let request = RecordingWriterSegmentStartRequest {
@@ -217,5 +265,94 @@ mod tests {
             .block_on(client.write("request-1", request))
             .unwrap_err();
         assert!(error.to_string().contains("invalid writer chunk"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_uses_length_prefixed_frames_and_accepts_matching_identity() {
+        let response = serde_json::to_vec(&json!({
+            "schema": HARBOROS_RECORDING_WRITER_SCHEMA,
+            "request_id": "request-1",
+            "ok": true,
+            "data": {
+                "lease_ref": "lease-1",
+                "job_id": "job-1",
+                "slot_id": "TF-1",
+                "recording_expires_at": "2099-01-01T00:00:00Z",
+                "recording_state": "active",
+                "capability_profile": "tf_recording",
+                "active_segment_id": null
+            },
+            "error": null
+        }))
+        .unwrap();
+        let (path, server) =
+            spawn_response_server("success", response.len() as u32, response).await;
+        let result = RecordingWriterClient::new(&path)
+            .resolve("request-1", "lease-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(result.slot_id, "TF-1");
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_rejects_response_identity_mismatch() {
+        let response = serde_json::to_vec(&json!({
+            "schema": HARBOROS_RECORDING_WRITER_SCHEMA,
+            "request_id": "different-request",
+            "ok": true,
+            "data": {
+                "lease_ref": "lease-1",
+                "job_id": "job-1",
+                "slot_id": "TF-1",
+                "recording_expires_at": "2099-01-01T00:00:00Z",
+                "recording_state": "active",
+                "capability_profile": "tf_recording",
+                "active_segment_id": null
+            },
+            "error": null
+        }))
+        .unwrap();
+        let (path, server) =
+            spawn_response_server("identity", response.len() as u32, response).await;
+        let error = RecordingWriterClient::new(&path)
+            .resolve("request-1", "lease-1".to_string())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("identity does not match"));
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_rejects_oversized_response_before_allocating_payload() {
+        let (path, server) =
+            spawn_response_server("oversized", (MAX_FRAME_BYTES + 1) as u32, Vec::new()).await;
+        let error = RecordingWriterClient::new(&path)
+            .resolve("request-1", "lease-1".to_string())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid frame length"));
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_rejects_truncated_response() {
+        let (path, server) = spawn_response_server("truncated", 32, b"{}".to_vec()).await;
+        let error = RecordingWriterClient::new(&path)
+            .resolve("request-1", "lease-1".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("early eof") || error.to_string().contains("failed to fill")
+        );
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }
