@@ -17,7 +17,7 @@ use harborlookout_contracts::{
     RecordingStatusResponse, RestartRecordingRequest, RestartRecordingResponse, StartAnalysisRequest,
     StartAnalysisResponse, StartRecordingRequest, StartRecordingResponse, StopAnalysisRequest,
     StopAnalysisResponse, StopRecordingRequest, StopRecordingResponse, SyncAnalysisEventsRequest,
-    RecordingWriterSegmentCompleteRequest, RecordingWriterSegmentStartRequest,
+    RecordingWriterSegmentCompleteRequest, RecordingWriterSegmentStartV2Request,
     RecordingWriterSegmentWriteRequest,
 };
 use harborlookout_domain::{
@@ -184,8 +184,18 @@ async fn start_external_recording(
     let backend = state.backend.clone();
     let task_camera = camera.clone();
     let task_lease = lease.clone();
+    let task_session_ref = session_ref.clone();
     let task = tokio::spawn(async move {
-        run_external_recording(&backend, &task_camera, &task_lease, client, stop_rx, ready_tx).await
+        run_external_recording(
+            &backend,
+            &task_camera,
+            &task_lease,
+            &task_session_ref,
+            client,
+            stop_rx,
+            ready_tx,
+        )
+        .await
     });
     let (_program, _args, output_hint, pid) = ready_rx.await.map_err(|_| {
         (
@@ -264,6 +274,7 @@ async fn run_external_recording(
     backend: &FfmpegBackend,
     camera: &harborlookout_domain::Camera,
     lease: &harborlookout_domain::ExternalRecordingLease,
+    session_ref: &str,
     client: recording_writer::RecordingWriterClient,
     mut stop_rx: oneshot::Receiver<()>,
     ready_tx: oneshot::Sender<(String, Vec<String>, String, u32)>,
@@ -285,18 +296,19 @@ async fn run_external_recording(
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        command.kill_on_drop(true);
         let mut child = command.spawn()?;
         let pid = child.id().ok_or_else(|| anyhow::anyhow!("external ffmpeg process has no pid"))?;
         let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("external ffmpeg stdout is unavailable"))?;
         let segment_id = writer_segment_id(&session_id, sequence);
         if let Err(error) = client
-            .start(
+            .start_bound(
                 writer_request_id(&session_id, "start", sequence, None),
-                RecordingWriterSegmentStartRequest {
+                RecordingWriterSegmentStartV2Request {
                     lease_ref: lease.source_token.clone(),
                     segment_id: segment_id.clone(),
                     sequence,
+                    camera_id: camera.id.0.clone(),
+                    session_id: session_ref.to_string(),
                     started_at: None,
                 },
             )
@@ -312,12 +324,15 @@ async fn run_external_recording(
         let mut digest = Sha256::new();
         let mut bytes_done = 0u64;
         let mut buffer = vec![0u8; 768 * 1024];
+        let mut renew_interval = tokio::time::interval(Duration::from_secs(60));
+        renew_interval.tick().await;
+        let mut renew_count = 0u64;
         loop {
             tokio::select! {
                 _ = &mut stop_rx => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    let _ = client.complete(
+                    client.complete(
                         writer_request_id(&session_id, "interrupted", sequence, None),
                         RecordingWriterSegmentCompleteRequest {
                             lease_ref: lease.source_token.clone(),
@@ -327,24 +342,80 @@ async fn run_external_recording(
                             hash_sha256: Some(digest_hex(&digest)),
                             error_code: Some("RECORDING_STOPPED".into()),
                         },
-                    ).await;
+                    ).await?;
                     return Ok(());
                 }
+                _ = renew_interval.tick() => {
+                    renew_count += 1;
+                    if let Err(error) = client.renew(
+                        writer_request_id(&session_id, "renew-active", sequence, Some(renew_count)),
+                        lease.source_token.clone(),
+                    ).await {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = client.complete(
+                            writer_request_id(&session_id, "lease-failed", sequence, None),
+                            RecordingWriterSegmentCompleteRequest {
+                                lease_ref: lease.source_token.clone(),
+                                segment_id: segment_id.clone(),
+                                state: "interrupted".into(),
+                                bytes_done: Some(bytes_done),
+                                hash_sha256: Some(digest_hex(&digest)),
+                                error_code: Some("RECORDING_LEASE_RENEW_FAILED".into()),
+                            },
+                        ).await;
+                        return Err(error);
+                    }
+                }
                 read = stdout.read(&mut buffer) => {
-                    let count = read?;
+                    let count = match read {
+                        Ok(count) => count,
+                        Err(error) => {
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            let _ = client.complete(
+                                writer_request_id(&session_id, "capture-failed", sequence, None),
+                                RecordingWriterSegmentCompleteRequest {
+                                    lease_ref: lease.source_token.clone(),
+                                    segment_id: segment_id.clone(),
+                                    state: "interrupted".into(),
+                                    bytes_done: Some(bytes_done),
+                                    hash_sha256: Some(digest_hex(&digest)),
+                                    error_code: Some("CAPTURE_READ_FAILED".into()),
+                                },
+                            ).await;
+                            return Err(error.into());
+                        }
+                    };
                     if count == 0 {
                         break;
                     }
-                    digest.update(&buffer[..count]);
-                    bytes_done = bytes_done.saturating_add(count as u64);
-                    client.write(
-                        writer_request_id(&session_id, "write", sequence, Some(bytes_done)),
+                    let next_bytes_done = bytes_done.saturating_add(count as u64);
+                    if let Err(error) = client.write(
+                        writer_request_id(&session_id, "write", sequence, Some(next_bytes_done)),
                         RecordingWriterSegmentWriteRequest {
                             lease_ref: lease.source_token.clone(),
                             segment_id: segment_id.clone(),
                             chunk_base64: BASE64.encode(&buffer[..count]),
                         },
-                    ).await?;
+                    ).await {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = client.complete(
+                            writer_request_id(&session_id, "write-failed", sequence, None),
+                            RecordingWriterSegmentCompleteRequest {
+                                lease_ref: lease.source_token.clone(),
+                                segment_id: segment_id.clone(),
+                                state: "interrupted".into(),
+                                bytes_done: Some(bytes_done),
+                                hash_sha256: Some(digest_hex(&digest)),
+                                error_code: Some("RECORDING_WRITE_FAILED".into()),
+                            },
+                        ).await;
+                        return Err(error);
+                    }
+                    digest.update(&buffer[..count]);
+                    bytes_done = next_bytes_done;
                 }
             }
         }
