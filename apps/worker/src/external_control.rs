@@ -12,7 +12,7 @@ use tracing::warn;
 
 use super::{
     WorkerAppState, recording_status, start_external_recording, stop_external_recording,
-    valid_opaque_ref,
+    valid_camera_id, valid_opaque_ref,
 };
 use harborlookout_contracts::RecordingStatusRequest;
 
@@ -160,7 +160,7 @@ async fn dispatch<'a>(state: &WorkerAppState, request: &'a Request) -> Response<
                     );
                 }
             };
-            if !valid_opaque_ref(&payload.camera_id) || !valid_opaque_ref(&payload.session_ref) {
+            if !valid_camera_id(&payload.camera_id) || !valid_opaque_ref(&payload.session_ref) {
                 return failure(
                     &request.request_id,
                     "BAD_REQUEST",

@@ -155,6 +155,9 @@ async fn start_external_recording(
     if !valid_opaque_ref(&session_ref) {
         return Err((StatusCode::BAD_REQUEST, "invalid external recording session reference".into()));
     }
+    if !valid_camera_id(&camera.id.0) {
+        return Err((StatusCode::BAD_REQUEST, "invalid external recording camera ID".into()));
+    }
     lease
         .validate(now_unix_ms())
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -216,6 +219,15 @@ fn valid_opaque_ref(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn valid_camera_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && !value.contains("..")
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 async fn stop_external_recording(
@@ -1092,5 +1104,12 @@ mod tests {
         assert!(!valid_opaque_ref(""));
         assert!(!valid_opaque_ref("../session"));
         assert!(!valid_opaque_ref("session with space"));
+    }
+
+    #[test]
+    fn external_camera_id_accepts_registry_separators_but_not_paths() {
+        assert!(valid_camera_id("camera.porch:main"));
+        assert!(!valid_camera_id("../camera"));
+        assert!(!valid_camera_id("camera/porch"));
     }
 }
