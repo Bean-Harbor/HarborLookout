@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use anyhow::Context;
 use anyhow::{Result, anyhow, bail};
+#[cfg(test)]
+use harborlookout_contracts::RecordingWriterSegmentStartRequest;
 use harborlookout_contracts::{
     HARBOROS_RECORDING_WRITER_MAX_CHUNK_BYTES, HARBOROS_RECORDING_WRITER_SCHEMA,
     HARBOROS_RECORDING_WRITER_V2_SCHEMA, RecordingWriterLeaseResolveRequest,
     RecordingWriterLeaseResponse, RecordingWriterSegmentCompleteRequest,
-    RecordingWriterSegmentResponse, RecordingWriterSegmentStartRequest,
-    RecordingWriterSegmentStartV2Request, RecordingWriterSegmentWriteRequest,
+    RecordingWriterSegmentResponse, RecordingWriterSegmentStartV2Request,
+    RecordingWriterSegmentWriteRequest,
 };
 #[cfg(unix)]
 use serde::Deserialize;
@@ -85,14 +87,6 @@ impl RecordingWriterClient {
             RecordingWriterLeaseResolveRequest { lease_ref },
         )
         .await
-    }
-
-    pub async fn start(
-        &self,
-        request_id: impl Into<String>,
-        request: RecordingWriterSegmentStartRequest,
-    ) -> Result<RecordingWriterSegmentResponse> {
-        self.call(request_id.into(), "segment/start", request).await
     }
 
     pub async fn start_bound(
