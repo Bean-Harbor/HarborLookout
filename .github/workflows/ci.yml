@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - codex/harborlookout-recording-mvp-20260501
+      - main
 
 permissions:
   contents: read
