@@ -188,6 +188,9 @@ impl<
     }
 
     pub async fn register_camera(&self, request: &RegisterCameraRequest) -> Result<RegisterCameraResponse> {
+        if let Some(start_recording) = request.start_recording.as_ref() {
+            validate_external_recording_lease(start_recording.external_recording_lease.as_ref())?;
+        }
         self.backend.probe_camera(&request.camera)?;
         self.store.upsert_camera(&request.camera)?;
 
@@ -196,6 +199,7 @@ impl<
                 self.start_recording(&StartRecordingRequest {
                     camera: request.camera.clone(),
                     output_directory: start_recording.output_directory.clone(),
+                    external_recording_lease: start_recording.external_recording_lease.clone(),
                 })
                 .await?,
             )
@@ -226,6 +230,7 @@ impl<
     }
 
     pub async fn start_recording(&self, request: &StartRecordingRequest) -> Result<StartRecordingResponse> {
+        validate_external_recording_lease(request.external_recording_lease.as_ref())?;
         self.backend.probe_camera(&request.camera)?;
         self.store.upsert_camera(&request.camera)?;
 
@@ -233,7 +238,11 @@ impl<
         self.store.upsert_session(&RecordingSession {
             camera_id: request.camera.id.clone(),
             worker_name: self.worker.name().to_string(),
-            output_directory: request.output_directory.clone(),
+            output_directory: if request.external_recording_lease.is_some() {
+                String::new()
+            } else {
+                request.output_directory.clone()
+            },
             output_hint: Some(response.output_hint.clone()),
             state: RecordingState::Running,
             pid: Some(response.pid),
@@ -258,6 +267,7 @@ impl<
     }
 
     pub async fn restart_recording(&self, request: &RestartRecordingRequest) -> Result<RestartRecordingResponse> {
+        validate_external_recording_lease(request.external_recording_lease.as_ref())?;
         self.backend.probe_camera(&request.camera)?;
         self.store.upsert_camera(&request.camera)?;
 
@@ -265,7 +275,11 @@ impl<
         self.store.upsert_session(&RecordingSession {
             camera_id: request.camera.id.clone(),
             worker_name: self.worker.name().to_string(),
-            output_directory: request.output_directory.clone(),
+            output_directory: if request.external_recording_lease.is_some() {
+                String::new()
+            } else {
+                request.output_directory.clone()
+            },
             output_hint: Some(response.output_hint.clone()),
             state: RecordingState::Running,
             pid: Some(response.pid),
@@ -470,6 +484,11 @@ impl<
         let Some(output_hint) = session.output_hint.as_deref() else {
             return Ok(0);
         };
+        if output_hint.starts_with("external:") {
+            // HarborOS owns external segment bytes and lifecycle metadata; the
+            // Lookout control plane must not scan a path it does not own.
+            return Ok(0);
+        }
         let discovered = discover_recording_segments(camera, output_hint, tail_state)?;
         let count = discovered.len();
         for segment in discovered {
@@ -613,7 +632,7 @@ mod tests {
     use harborlookout_domain::{
         ArtifactId, ArtifactKind, Camera, CameraId, CameraStream, EventArtifact, EventId, EventKind,
         EventSeverity, RtspSource, RtspTransport, StreamProfile, StreamRole, SurveillanceEvent,
-        WorkerState,
+        ExternalRecordingLease, WorkerState,
     };
     use harborlookout_media_core::{MediaBackend, ProbeSummary, RecordingPlan, SnapshotPlan};
     use harborlookout_storage::SqliteCameraStore;
@@ -638,7 +657,11 @@ mod tests {
                     backend: "test".into(),
                     program: "test-backend".into(),
                     args: vec![request.camera.id.0.clone()],
-                    output_hint: format!("{}/{}-%06d.mp4", request.output_directory, request.camera.id.0),
+                    output_hint: if request.external_recording_lease.is_some() {
+                        format!("external:{}", request.camera.id.0)
+                    } else {
+                        format!("{}/{}-%06d.mp4", request.output_directory, request.camera.id.0)
+                    },
                     pid: 4242,
                 })
             })
@@ -882,6 +905,7 @@ mod tests {
             },
             start_recording: Some(harborlookout_contracts::RegisterCameraRecordingRequest {
                 output_directory: "recordings/register-start".into(),
+                external_recording_lease: None,
             }),
         };
 
@@ -980,11 +1004,97 @@ mod tests {
                 enabled: true,
             },
             output_directory: "recordings".into(),
+            external_recording_lease: None,
         };
 
         let response = control_plane.start_recording(&request).await.unwrap();
         assert_eq!(response.pid, 4242);
         assert_eq!(control_plane.health().unwrap().active_recordings, 1);
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_external_recording_and_persists_opaque_session() {
+        let store = SqliteCameraStore::open(":memory:").unwrap();
+        let control_plane = ControlPlane::new(TestBackend, store, TestWorker);
+        let request = StartRecordingRequest {
+            camera: Camera {
+                id: CameraId("cam-external".into()),
+                name: "External target".into(),
+                streams: Vec::new(),
+                source: RtspSource {
+                    url: "rtsp://camera.local/external".into(),
+                    transport: RtspTransport::Tcp,
+                },
+                stream_profile: StreamProfile {
+                    width: 1280,
+                    height: 720,
+                    fps: 15,
+                    segment_seconds: 10,
+                },
+                enabled: true,
+            },
+            output_directory: "should-never-be-used".into(),
+            external_recording_lease: Some(ExternalRecordingLease {
+                lease_id: "lease-tf-1".into(),
+                slot_id: "TF-1".into(),
+                source_token: "opaque-source-token".into(),
+                expires_at_unix_ms: now_unix_ms() + 60_000,
+            }),
+        };
+
+        let response = control_plane.start_recording(&request).await.unwrap();
+        assert_eq!(response.pid, 4242);
+        assert_eq!(control_plane.health().unwrap().active_recordings, 1);
+        let session = control_plane
+            .store
+            .get_session(&CameraId("cam-external".into()))
+            .unwrap()
+            .unwrap();
+        assert!(session.output_directory.is_empty());
+        control_plane
+            .stop_recording(&StopRecordingRequest {
+                camera_id: CameraId("cam-external".into()),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_external_recording_during_registration() {
+        let store = SqliteCameraStore::open(":memory:").unwrap();
+        let control_plane = ControlPlane::new(TestBackend, store, TestWorker);
+        let request = RegisterCameraRequest {
+            camera: Camera {
+                id: CameraId("cam-register-external".into()),
+                name: "External registration".into(),
+                streams: Vec::new(),
+                source: RtspSource {
+                    url: "rtsp://camera.local/register-external".into(),
+                    transport: RtspTransport::Tcp,
+                },
+                stream_profile: StreamProfile {
+                    width: 1280,
+                    height: 720,
+                    fps: 15,
+                    segment_seconds: 10,
+                },
+                enabled: true,
+            },
+            start_recording: Some(harborlookout_contracts::RegisterCameraRecordingRequest {
+                output_directory: "should-never-be-used".into(),
+                external_recording_lease: Some(ExternalRecordingLease {
+                    lease_id: "lease-tf-1".into(),
+                    slot_id: "TF-1".into(),
+                    source_token: "opaque-source-token".into(),
+                    expires_at_unix_ms: now_unix_ms() + 60_000,
+                }),
+            }),
+        };
+
+        let response = control_plane.register_camera(&request).await.unwrap();
+        assert_eq!(response.camera_id, "cam-register-external");
+        assert!(response.recording.is_some());
+        assert_eq!(control_plane.list_cameras().unwrap().cameras.len(), 1);
     }
 
     #[tokio::test]
@@ -1177,4 +1287,13 @@ mod tests {
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
+}
+
+fn validate_external_recording_lease(
+    lease: Option<&harborlookout_domain::ExternalRecordingLease>,
+) -> Result<()> {
+    if let Some(lease) = lease {
+        lease.validate(now_unix_ms())?;
+    }
+    Ok(())
 }

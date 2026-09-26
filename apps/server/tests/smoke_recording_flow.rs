@@ -111,6 +111,7 @@ async fn smoke_recording_flow_persists_segments() -> Result<()> {
         &StartRecordingRequest {
             camera: camera.clone(),
             output_directory: output_directory.to_string_lossy().to_string(),
+            external_recording_lease: None,
         },
     )
     .await?;
@@ -234,6 +235,7 @@ async fn register_camera_can_optionally_start_recording() -> Result<()> {
             camera: camera.clone(),
             start_recording: Some(RegisterCameraRecordingRequest {
                 output_directory: output_directory.to_string_lossy().to_string(),
+                external_recording_lease: None,
             }),
         },
     )
@@ -537,6 +539,7 @@ async fn fake_restart_recording(
         Json(StartRecordingRequest {
             camera: request.camera.clone(),
             output_directory: request.output_directory.clone(),
+            external_recording_lease: request.external_recording_lease.clone(),
         }),
     )
     .await

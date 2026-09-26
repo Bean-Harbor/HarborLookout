@@ -5,6 +5,46 @@ use harborlookout_media_core::{MediaBackend, ProbeSummary, RecordingPlan, Snapsh
 #[derive(Debug, Clone, Default)]
 pub struct FfmpegBackend;
 
+impl FfmpegBackend {
+    /// Build one bounded fragmented-MP4 segment for the HarborOS byte writer.
+    /// The output is stdout; no external mount or output path enters the plan.
+    pub fn build_external_segment_plan(&self, camera: &Camera) -> Result<RecordingPlan> {
+        camera.validate()?;
+
+        let stream = camera.preferred_stream(StreamRole::Record);
+        let transport = match stream.source.transport {
+            RtspTransport::Tcp => "tcp",
+            RtspTransport::Udp => "udp",
+            RtspTransport::Auto => "prefer_tcp",
+        };
+
+        Ok(RecordingPlan {
+            program: ffmpeg_program(),
+            args: vec![
+                "-hide_banner".into(),
+                "-loglevel".into(),
+                "warning".into(),
+                "-rtsp_transport".into(),
+                transport.into(),
+                "-i".into(),
+                stream.source.url,
+                "-map".into(),
+                "0:v:0".into(),
+                "-c:v".into(),
+                "copy".into(),
+                "-t".into(),
+                stream.stream_profile.segment_seconds.to_string(),
+                "-movflags".into(),
+                "frag_keyframe+empty_moov+default_base_moof".into(),
+                "-f".into(),
+                "mp4".into(),
+                "pipe:1".into(),
+            ],
+            output_hint: format!("external:{}", camera.id.0),
+        })
+    }
+}
+
 impl MediaBackend for FfmpegBackend {
     fn name(&self) -> &'static str {
         "ffmpeg"

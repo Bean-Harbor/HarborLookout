@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: rustfmt --edition 2024 --check apps/worker/src/recording_writer.rs
+      - run: cargo clippy -p harborlookout-worker --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
