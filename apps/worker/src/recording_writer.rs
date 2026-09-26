@@ -3,12 +3,11 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use anyhow::Context;
 use anyhow::{Result, anyhow, bail};
-#[cfg(unix)]
-use harborlookout_contracts::HARBOROS_RECORDING_WRITER_SCHEMA;
 use harborlookout_contracts::{
-    HARBOROS_RECORDING_WRITER_MAX_CHUNK_BYTES, RecordingWriterLeaseResolveRequest,
-    RecordingWriterLeaseResponse, RecordingWriterSegmentCompleteRequest,
-    RecordingWriterSegmentResponse, RecordingWriterSegmentStartRequest,
+    HARBOROS_RECORDING_WRITER_MAX_CHUNK_BYTES, HARBOROS_RECORDING_WRITER_SCHEMA,
+    HARBOROS_RECORDING_WRITER_V2_SCHEMA, RecordingWriterLeaseResolveRequest,
+    RecordingWriterLeaseResponse, RecordingWriterSegmentCompleteRequest, RecordingWriterSegmentResponse,
+    RecordingWriterSegmentStartRequest, RecordingWriterSegmentStartV2Request,
     RecordingWriterSegmentWriteRequest,
 };
 #[cfg(unix)]
@@ -96,6 +95,23 @@ impl RecordingWriterClient {
         self.call(request_id.into(), "segment/start", request).await
     }
 
+    pub async fn start_bound(
+        &self,
+        request_id: impl Into<String>,
+        request: RecordingWriterSegmentStartV2Request,
+    ) -> Result<RecordingWriterSegmentResponse> {
+        request
+            .validate_shape()
+            .map_err(|error| anyhow!("invalid writer binding: {error}"))?;
+        self.call_schema(
+            HARBOROS_RECORDING_WRITER_V2_SCHEMA,
+            request_id.into(),
+            "segment/start",
+            request,
+        )
+        .await
+    }
+
     pub async fn write(
         &self,
         request_id: impl Into<String>,
@@ -139,15 +155,30 @@ impl RecordingWriterClient {
         T: Serialize,
         R: DeserializeOwned,
     {
+        self.call_schema(HARBOROS_RECORDING_WRITER_SCHEMA, request_id, operation, payload)
+            .await
+    }
+
+    async fn call_schema<T, R>(
+        &self,
+        schema: &'static str,
+        request_id: String,
+        operation: &str,
+        payload: T,
+    ) -> Result<R>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
         #[cfg(not(unix))]
         {
-            let _ = (request_id, operation, payload);
+            let _ = (schema, request_id, operation, payload);
             bail!("recording writer IPC requires Unix-domain sockets");
         }
         #[cfg(unix)]
         {
             let request = Request {
-                schema: HARBOROS_RECORDING_WRITER_SCHEMA,
+                schema,
                 request_id: request_id.clone(),
                 operation,
                 payload,
@@ -174,7 +205,7 @@ impl RecordingWriterClient {
             let mut response_bytes = vec![0; length];
             stream.read_exact(&mut response_bytes).await?;
             let response: Response<R> = serde_json::from_slice(&response_bytes)?;
-            if response.schema != HARBOROS_RECORDING_WRITER_SCHEMA
+            if response.schema != schema
                 || response.request_id != request_id
             {
                 bail!("recording writer response identity does not match the request");
@@ -257,6 +288,52 @@ mod tests {
         assert!(!encoded.contains("output_directory"));
         assert!(!encoded.contains("mount"));
         assert!(!encoded.contains("/data"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_start_uses_v2_schema_and_rejects_v1_response() {
+        let path = test_socket_path("bound-start");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let length = stream.read_u32().await.unwrap() as usize;
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["schema"], HARBOROS_RECORDING_WRITER_V2_SCHEMA);
+            assert_eq!(request["operation"], "segment/start");
+            assert_eq!(request["payload"]["camera_id"], "camera.porch");
+            assert_eq!(request["payload"]["session_id"], "claim-1");
+            assert!(request["payload"].get("output_directory").is_none());
+            let response = serde_json::to_vec(&json!({
+                "schema": HARBOROS_RECORDING_WRITER_SCHEMA,
+                "request_id": "request-1",
+                "ok": true,
+                "data": null,
+                "error": null
+            }))
+            .unwrap();
+            stream.write_u32(response.len() as u32).await.unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+        let error = RecordingWriterClient::new(&path)
+            .start_bound(
+                "request-1",
+                RecordingWriterSegmentStartV2Request {
+                    lease_ref: "lease-1".into(),
+                    segment_id: "segment-1".into(),
+                    sequence: 1,
+                    camera_id: "camera.porch".into(),
+                    session_id: "claim-1".into(),
+                    started_at: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("identity does not match"));
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

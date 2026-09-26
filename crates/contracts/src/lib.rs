@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Versioned HarborOS writer seam. The worker must not translate these
 /// requests into an output directory or a device path.
 pub const HARBOROS_RECORDING_WRITER_SCHEMA: &str = "harboros.recording-writer.v1";
+pub const HARBOROS_RECORDING_WRITER_V2_SCHEMA: &str = "harboros.recording-writer.v2";
 pub const HARBOROS_RECORDING_WRITER_MAX_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// HarborOS writer requests intentionally contain only opaque identifiers.
@@ -52,6 +53,31 @@ impl RecordingWriterSegmentStartRequest {
     pub fn validate_shape(&self) -> Result<(), &'static str> {
         if !valid_opaque_id(&self.lease_ref) || !valid_opaque_id(&self.segment_id) {
             return Err("lease_ref and segment_id must be opaque identifiers");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingWriterSegmentStartV2Request {
+    pub lease_ref: String,
+    pub segment_id: String,
+    pub sequence: u64,
+    pub camera_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+}
+
+impl RecordingWriterSegmentStartV2Request {
+    pub fn validate_shape(&self) -> Result<(), &'static str> {
+        if !valid_opaque_id(&self.lease_ref)
+            || !valid_opaque_id(&self.segment_id)
+            || !valid_opaque_id(&self.camera_id)
+            || !valid_opaque_id(&self.session_id)
+        {
+            return Err("writer v2 binding fields must be opaque identifiers");
         }
         Ok(())
     }
@@ -559,6 +585,30 @@ mod tests {
             started_at: None,
         };
         assert!(request.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn bound_writer_start_requires_camera_and_session_without_paths() {
+        let request = RecordingWriterSegmentStartV2Request {
+            lease_ref: "lease-1".into(),
+            segment_id: "segment-1".into(),
+            sequence: 1,
+            camera_id: "camera.porch".into(),
+            session_id: "session-1".into(),
+            started_at: None,
+        };
+        assert!(request.validate_shape().is_ok());
+        let mut path_request = request.clone();
+        path_request.session_id = "../session".into();
+        assert!(path_request.validate_shape().is_err());
+        let mut missing_camera = request;
+        missing_camera.camera_id.clear();
+        assert!(missing_camera.validate_shape().is_err());
+        let error = serde_json::from_str::<RecordingWriterSegmentStartV2Request>(
+            r#"{"lease_ref":"lease-1","segment_id":"segment-1","sequence":1,"camera_id":"camera.porch","session_id":"session-1","output_directory":"/data"}"#,
+        )
+        .expect_err("bound writer request must reject output_directory");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
