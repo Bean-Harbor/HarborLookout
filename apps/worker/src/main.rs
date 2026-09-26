@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use axum::extract::State;
@@ -35,6 +36,8 @@ use tracing::info;
 use uuid::Uuid;
 
 mod recording_writer;
+#[cfg(unix)]
+mod external_control;
 
 struct ManagedRecording {
     pid: u32,
@@ -47,6 +50,9 @@ struct ManagedRecording {
 struct ManagedExternalRecording {
     pid: u32,
     output_hint: String,
+    session_ref: String,
+    lease_ref: String,
+    start_response: StartRecordingResponse,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<()>>,
 }
@@ -71,6 +77,7 @@ struct WorkerAppState {
     backend: FfmpegBackend,
     sessions: Arc<Mutex<HashMap<String, ManagedRecording>>>,
     external_sessions: Arc<Mutex<HashMap<String, ManagedExternalRecording>>>,
+    external_control_gate: Arc<Mutex<()>>,
     analyses: Arc<Mutex<HashMap<String, ManagedAnalysis>>>,
 }
 
@@ -82,8 +89,12 @@ async fn main() -> Result<()> {
         backend: FfmpegBackend,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         external_sessions: Arc::new(Mutex::new(HashMap::new())),
+        external_control_gate: Arc::new(Mutex::new(())),
         analyses: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    #[cfg(unix)]
+    external_control::start_if_configured(state.clone()).await?;
 
     let app = Router::new()
         .route("/health", get(health))
@@ -138,10 +149,27 @@ async fn start_external_recording(
     State(state): State<WorkerAppState>,
     camera: harborlookout_domain::Camera,
     lease: harborlookout_domain::ExternalRecordingLease,
+    session_ref: String,
 ) -> Result<Json<StartRecordingResponse>, (StatusCode, String)> {
+    let _gate = state.external_control_gate.lock().await;
+    if !valid_opaque_ref(&session_ref) {
+        return Err((StatusCode::BAD_REQUEST, "invalid external recording session reference".into()));
+    }
     lease
         .validate(now_unix_ms())
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    if let Some(existing) = state.external_sessions.lock().await.get(&camera.id.0) {
+        if existing.session_ref == session_ref
+            && existing.lease_ref == lease.source_token
+            && !existing.task.is_finished()
+        {
+            return Ok(Json(existing.start_response.clone()));
+        }
+        return Err((StatusCode::CONFLICT, "camera already has an external recording session".into()));
+    }
+    if !state.external_sessions.lock().await.is_empty() {
+        return Err((StatusCode::CONFLICT, "TF-1 already has an active recording".into()));
+    }
     let camera_id = camera.id.0.clone();
     ensure_not_running(&state, &camera_id).await?;
 
@@ -156,28 +184,68 @@ async fn start_external_recording(
     let task = tokio::spawn(async move {
         run_external_recording(&backend, &task_camera, &task_lease, client, stop_rx, ready_tx).await
     });
-    let (program, args, output_hint, pid) = ready_rx.await.map_err(|_| {
+    let (_program, _args, output_hint, pid) = ready_rx.await.map_err(|_| {
         (
             StatusCode::BAD_GATEWAY,
             "external recording failed before the first segment started".to_string(),
         )
     })?;
+    let response = StartRecordingResponse {
+        backend: "ffmpeg".into(),
+        program: "ffmpeg".into(),
+        args: Vec::new(),
+        output_hint: output_hint.clone(),
+        pid,
+    };
     state.external_sessions.lock().await.insert(
         camera_id.clone(),
         ManagedExternalRecording {
             pid,
             output_hint: output_hint.clone(),
+            session_ref,
+            lease_ref: lease.source_token,
+            start_response: response.clone(),
             stop: Some(stop_tx),
             task,
         },
     );
-    Ok(Json(StartRecordingResponse {
-        backend: "ffmpeg".into(),
-        program,
-        args,
-        output_hint,
-        pid,
-    }))
+    Ok(Json(response))
+}
+
+fn valid_opaque_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+async fn stop_external_recording(
+    state: &WorkerAppState,
+    camera_id: &str,
+    session_ref: &str,
+) -> Result<StopRecordingResponse, (StatusCode, String)> {
+    let _gate = state.external_control_gate.lock().await;
+    let mut sessions = state.external_sessions.lock().await;
+    let Some(existing) = sessions.get(camera_id) else {
+        return Ok(StopRecordingResponse { camera_id: camera_id.into(), stopped: false });
+    };
+    if existing.session_ref != session_ref {
+        return Err((StatusCode::FORBIDDEN, "external recording session does not match".into()));
+    }
+    let mut managed = sessions.remove(camera_id).expect("checked external session");
+    drop(sessions);
+    if let Some(stop) = managed.stop.take() {
+        let _ = stop.send(());
+    }
+    let mut task = managed.task;
+    match tokio::time::timeout(Duration::from_secs(30), &mut task).await {
+        Ok(result) => result.map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?,
+        Err(_) => {
+            task.abort();
+            return Err((StatusCode::GATEWAY_TIMEOUT, "external recording stop timed out".into()));
+        }
+    }
+    Ok(StopRecordingResponse { camera_id: camera_id.into(), stopped: true })
 }
 
 async fn run_external_recording(
@@ -203,7 +271,8 @@ async fn run_external_recording(
             .args(&plan.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
         command.kill_on_drop(true);
         let mut child = command.spawn()?;
         let pid = child.id().ok_or_else(|| anyhow::anyhow!("external ffmpeg process has no pid"))?;
@@ -314,8 +383,8 @@ async fn start_recording(
     State(state): State<WorkerAppState>,
     Json(request): Json<StartRecordingRequest>,
 ) -> Result<Json<StartRecordingResponse>, (StatusCode, String)> {
-    if let Some(lease) = request.external_recording_lease.clone() {
-        return start_external_recording(State(state), request.camera, lease).await;
+    if request.external_recording_lease.is_some() {
+        return Err((StatusCode::FORBIDDEN, "external recording requires authenticated local control".into()));
     }
     reject_external_recording_lease(request.external_recording_lease.as_ref())?;
     let camera_id = request.camera.id.0.clone();
@@ -372,15 +441,8 @@ async fn stop_recording(
     State(state): State<WorkerAppState>,
     Json(request): Json<StopRecordingRequest>,
 ) -> Result<Json<StopRecordingResponse>, (StatusCode, String)> {
-    if let Some(mut managed) = state.external_sessions.lock().await.remove(&request.camera_id.0) {
-        if let Some(stop) = managed.stop.take() {
-            let _ = stop.send(());
-        }
-        let _ = managed.task.await;
-        return Ok(Json(StopRecordingResponse {
-            camera_id: request.camera_id.0,
-            stopped: true,
-        }));
+    if state.external_sessions.lock().await.contains_key(&request.camera_id.0) {
+        return Err((StatusCode::FORBIDDEN, "external recording requires authenticated local control".into()));
     }
     let mut sessions = state.sessions.lock().await;
     let Some(mut managed) = sessions.remove(&request.camera_id.0) else {
@@ -406,19 +468,8 @@ async fn restart_recording(
     State(state): State<WorkerAppState>,
     Json(request): Json<RestartRecordingRequest>,
 ) -> Result<Json<RestartRecordingResponse>, (StatusCode, String)> {
-    if let Some(lease) = request.external_recording_lease.clone() {
-        let stop_request = StopRecordingRequest { camera_id: request.camera.id.clone() };
-        let _ = stop_recording(State(state.clone()), Json(stop_request)).await?;
-        let start_response = start_external_recording(State(state.clone()), request.camera.clone(), lease).await?.0;
-        return Ok(Json(RestartRecordingResponse {
-            camera_id: request.camera.id.0,
-            restarted: true,
-            backend: start_response.backend,
-            program: start_response.program,
-            args: start_response.args,
-            output_hint: start_response.output_hint,
-            pid: start_response.pid,
-        }));
+    if request.external_recording_lease.is_some() {
+        return Err((StatusCode::FORBIDDEN, "external recording requires authenticated local control".into()));
     }
     reject_external_recording_lease(request.external_recording_lease.as_ref())?;
     let stop_request = StopRecordingRequest {
@@ -993,11 +1044,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_recording_fails_closed_when_writer_is_unavailable() {
+    async fn external_recording_http_start_is_rejected() {
         let state = WorkerAppState {
             backend: FfmpegBackend,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             external_sessions: Arc::new(Mutex::new(HashMap::new())),
+            external_control_gate: Arc::new(Mutex::new(())),
             analyses: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = StartRecordingRequest {
@@ -1028,8 +1080,17 @@ mod tests {
 
         let result = start_recording(State(state.clone()), Json(request)).await;
         let error = result.unwrap_err();
-        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
-        assert!(error.1.contains("external recording failed"));
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(error.1.contains("authenticated local control"));
         assert!(state.sessions.lock().await.is_empty());
+        assert!(state.external_sessions.lock().await.is_empty());
+    }
+
+    #[test]
+    fn external_session_reference_must_be_opaque() {
+        assert!(valid_opaque_ref("session_123-abc"));
+        assert!(!valid_opaque_ref(""));
+        assert!(!valid_opaque_ref("../session"));
+        assert!(!valid_opaque_ref("session with space"));
     }
 }
