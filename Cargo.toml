@@ -20,7 +20,7 @@ edition = "2024"
 license = "MIT"
 version = "0.1.0"
 authors = ["Bean-Harbor"]
-repository = "https://github.com/Bean-Harbor/HarborLookout"
+repository = "https://github.com/Bean-Harbor-Engineering/HarborLookout"
 
 [workspace.dependencies]
 anyhow = "1"
