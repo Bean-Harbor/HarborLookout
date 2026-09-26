@@ -32,6 +32,7 @@ use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
 use tracing::info;
+use uuid::Uuid;
 
 mod recording_writer;
 
@@ -187,19 +188,14 @@ async fn run_external_recording(
     mut stop_rx: oneshot::Receiver<()>,
     ready_tx: oneshot::Sender<(String, Vec<String>, String, u32)>,
 ) -> Result<()> {
+    let session_id = Uuid::new_v4().simple().to_string();
     client
-        .resolve(format!("lookout-resolve-{}", now_unix_ms()), lease.source_token.clone())
+        .resolve(writer_request_id(&session_id, "resolve", 0, None), lease.source_token.clone())
         .await?;
     let mut ready_tx = Some(ready_tx);
-    let safe_camera_id = camera
-        .id
-        .0
-        .chars()
-        .map(|character| if character.is_ascii_alphanumeric() || character == '-' || character == '_' { character } else { '-' })
-        .collect::<String>();
     for sequence in 0u64.. {
         client
-            .renew(format!("lookout-renew-{sequence}-{}", now_unix_ms()), lease.source_token.clone())
+            .renew(writer_request_id(&session_id, "renew", sequence, None), lease.source_token.clone())
             .await?;
         let plan = backend.build_external_segment_plan(camera)?;
         let mut command = Command::new(&plan.program);
@@ -208,13 +204,14 @@ async fn run_external_recording(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        command.kill_on_drop(true);
         let mut child = command.spawn()?;
         let pid = child.id().ok_or_else(|| anyhow::anyhow!("external ffmpeg process has no pid"))?;
         let mut stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("external ffmpeg stdout is unavailable"))?;
-        let segment_id = format!("external-{safe_camera_id}-{sequence}");
+        let segment_id = writer_segment_id(&session_id, sequence);
         if let Err(error) = client
             .start(
-                format!("lookout-start-{sequence}-{}", now_unix_ms()),
+                writer_request_id(&session_id, "start", sequence, None),
                 RecordingWriterSegmentStartRequest {
                     lease_ref: lease.source_token.clone(),
                     segment_id: segment_id.clone(),
@@ -240,7 +237,7 @@ async fn run_external_recording(
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     let _ = client.complete(
-                        format!("lookout-interrupted-{sequence}-{}", now_unix_ms()),
+                        writer_request_id(&session_id, "interrupted", sequence, None),
                         RecordingWriterSegmentCompleteRequest {
                             lease_ref: lease.source_token.clone(),
                             segment_id: segment_id.clone(),
@@ -260,7 +257,7 @@ async fn run_external_recording(
                     digest.update(&buffer[..count]);
                     bytes_done = bytes_done.saturating_add(count as u64);
                     client.write(
-                        format!("lookout-write-{sequence}-{bytes_done}"),
+                        writer_request_id(&session_id, "write", sequence, Some(bytes_done)),
                         RecordingWriterSegmentWriteRequest {
                             lease_ref: lease.source_token.clone(),
                             segment_id: segment_id.clone(),
@@ -273,7 +270,7 @@ async fn run_external_recording(
         let status = child.wait().await?;
         if !status.success() {
             let _ = client.complete(
-                format!("lookout-failed-{sequence}-{}", now_unix_ms()),
+                writer_request_id(&session_id, "failed", sequence, None),
                 RecordingWriterSegmentCompleteRequest {
                     lease_ref: lease.source_token.clone(),
                     segment_id,
@@ -287,7 +284,7 @@ async fn run_external_recording(
         }
         client
             .complete(
-                format!("lookout-complete-{sequence}-{}", now_unix_ms()),
+                writer_request_id(&session_id, "complete", sequence, None),
                 RecordingWriterSegmentCompleteRequest {
                     lease_ref: lease.source_token.clone(),
                     segment_id,
@@ -300,6 +297,17 @@ async fn run_external_recording(
             .await?;
     }
     unreachable!()
+}
+
+fn writer_segment_id(session_id: &str, sequence: u64) -> String {
+    format!("external-{session_id}-{sequence}")
+}
+
+fn writer_request_id(session_id: &str, operation: &str, sequence: u64, bytes_done: Option<u64>) -> String {
+    match bytes_done {
+        Some(bytes_done) => format!("lookout-{session_id}-{operation}-{sequence}-{bytes_done}"),
+        None => format!("lookout-{session_id}-{operation}-{sequence}"),
+    }
 }
 
 async fn start_recording(
@@ -905,6 +913,27 @@ mod tests {
     use super::*;
     use harborlookout_contracts::StartRecordingRequest;
     use harborlookout_domain::{Camera, CameraId, ExternalRecordingLease, RtspSource, RtspTransport, StreamProfile};
+
+    #[test]
+    fn writer_ids_are_distinct_across_sessions_operations_and_chunks() {
+        let first = Uuid::new_v4().simple().to_string();
+        let second = Uuid::new_v4().simple().to_string();
+        assert_ne!(writer_segment_id(&first, 0), writer_segment_id(&second, 0));
+        assert_ne!(writer_segment_id(&first, 0), writer_segment_id(&first, 1));
+        assert_ne!(
+            writer_request_id(&first, "write", 0, Some(16)),
+            writer_request_id(&second, "write", 0, Some(16))
+        );
+        assert_ne!(
+            writer_request_id(&first, "write", 0, Some(16)),
+            writer_request_id(&first, "write", 0, Some(32))
+        );
+        assert_ne!(
+            writer_request_id(&first, "resolve", 0, None),
+            writer_request_id(&first, "renew", 0, None)
+        );
+        assert!(writer_request_id(&first, "write", u64::MAX, Some(u64::MAX)).len() <= 128);
+    }
 
     #[test]
     fn describes_failed_exit_with_numeric_code() {

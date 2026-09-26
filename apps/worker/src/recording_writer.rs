@@ -104,11 +104,18 @@ impl RecordingWriterClient {
         request
             .validate_shape()
             .map_err(|error| anyhow!("invalid writer chunk: {error}"))?;
+        let padding = request
+            .chunk_base64
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'=')
+            .count();
         let decoded_length = request
             .chunk_base64
             .len()
+            .saturating_div(4)
             .saturating_mul(3)
-            .saturating_div(4);
+            .saturating_sub(padding);
         if decoded_length > HARBOROS_RECORDING_WRITER_MAX_CHUNK_BYTES {
             bail!("recording writer chunk exceeds 1 MiB");
         }
@@ -188,6 +195,7 @@ impl RecordingWriterClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
     #[cfg(unix)]
     use serde_json::{Value, json};
@@ -249,6 +257,32 @@ mod tests {
         assert!(!encoded.contains("output_directory"));
         assert!(!encoded.contains("mount"));
         assert!(!encoded.contains("/data"));
+    }
+
+    #[test]
+    fn client_accepts_one_mib_chunk_and_rejects_larger_chunk() {
+        let client = RecordingWriterClient::new("missing-recording-writer.sock");
+        let request = |size| RecordingWriterSegmentWriteRequest {
+            lease_ref: "lease-1".into(),
+            segment_id: "segment-1".into(),
+            chunk_base64: BASE64.encode(vec![0u8; size]),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let exact = runtime
+            .block_on(client.write(
+                "request-exact",
+                request(HARBOROS_RECORDING_WRITER_MAX_CHUNK_BYTES),
+            ))
+            .unwrap_err();
+        assert!(!exact.to_string().contains("exceeds 1 MiB"));
+
+        let oversized = runtime
+            .block_on(client.write(
+                "request-oversized",
+                request(HARBOROS_RECORDING_WRITER_MAX_CHUNK_BYTES + 1),
+            ))
+            .unwrap_err();
+        assert!(oversized.to_string().contains("exceeds 1 MiB"));
     }
 
     #[cfg(unix)]
