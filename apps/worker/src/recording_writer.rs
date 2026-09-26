@@ -6,9 +6,9 @@ use anyhow::{Result, anyhow, bail};
 use harborlookout_contracts::{
     HARBOROS_RECORDING_WRITER_MAX_CHUNK_BYTES, HARBOROS_RECORDING_WRITER_SCHEMA,
     HARBOROS_RECORDING_WRITER_V2_SCHEMA, RecordingWriterLeaseResolveRequest,
-    RecordingWriterLeaseResponse, RecordingWriterSegmentCompleteRequest, RecordingWriterSegmentResponse,
-    RecordingWriterSegmentStartRequest, RecordingWriterSegmentStartV2Request,
-    RecordingWriterSegmentWriteRequest,
+    RecordingWriterLeaseResponse, RecordingWriterSegmentCompleteRequest,
+    RecordingWriterSegmentResponse, RecordingWriterSegmentStartRequest,
+    RecordingWriterSegmentStartV2Request, RecordingWriterSegmentWriteRequest,
 };
 #[cfg(unix)]
 use serde::Deserialize;
@@ -155,8 +155,13 @@ impl RecordingWriterClient {
         T: Serialize,
         R: DeserializeOwned,
     {
-        self.call_schema(HARBOROS_RECORDING_WRITER_SCHEMA, request_id, operation, payload)
-            .await
+        self.call_schema(
+            HARBOROS_RECORDING_WRITER_SCHEMA,
+            request_id,
+            operation,
+            payload,
+        )
+        .await
     }
 
     async fn call_schema<T, R>(
@@ -205,9 +210,7 @@ impl RecordingWriterClient {
             let mut response_bytes = vec![0; length];
             stream.read_exact(&mut response_bytes).await?;
             let response: Response<R> = serde_json::from_slice(&response_bytes)?;
-            if response.schema != schema
-                || response.request_id != request_id
-            {
+            if response.schema != schema || response.request_id != request_id {
                 bail!("recording writer response identity does not match the request");
             }
             if !response.ok {
