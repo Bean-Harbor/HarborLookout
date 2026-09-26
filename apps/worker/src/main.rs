@@ -332,7 +332,7 @@ async fn run_external_recording(
                 _ = &mut stop_rx => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    let _ = client.complete(
+                    client.complete(
                         writer_request_id(&session_id, "interrupted", sequence, None),
                         RecordingWriterSegmentCompleteRequest {
                             lease_ref: lease.source_token.clone(),
@@ -342,7 +342,7 @@ async fn run_external_recording(
                             hash_sha256: Some(digest_hex(&digest)),
                             error_code: Some("RECORDING_STOPPED".into()),
                         },
-                    ).await;
+                    ).await?;
                     return Ok(());
                 }
                 _ = renew_interval.tick() => {
@@ -368,20 +368,54 @@ async fn run_external_recording(
                     }
                 }
                 read = stdout.read(&mut buffer) => {
-                    let count = read?;
+                    let count = match read {
+                        Ok(count) => count,
+                        Err(error) => {
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                            let _ = client.complete(
+                                writer_request_id(&session_id, "capture-failed", sequence, None),
+                                RecordingWriterSegmentCompleteRequest {
+                                    lease_ref: lease.source_token.clone(),
+                                    segment_id: segment_id.clone(),
+                                    state: "interrupted".into(),
+                                    bytes_done: Some(bytes_done),
+                                    hash_sha256: Some(digest_hex(&digest)),
+                                    error_code: Some("CAPTURE_READ_FAILED".into()),
+                                },
+                            ).await;
+                            return Err(error.into());
+                        }
+                    };
                     if count == 0 {
                         break;
                     }
-                    digest.update(&buffer[..count]);
-                    bytes_done = bytes_done.saturating_add(count as u64);
-                    client.write(
-                        writer_request_id(&session_id, "write", sequence, Some(bytes_done)),
+                    let next_bytes_done = bytes_done.saturating_add(count as u64);
+                    if let Err(error) = client.write(
+                        writer_request_id(&session_id, "write", sequence, Some(next_bytes_done)),
                         RecordingWriterSegmentWriteRequest {
                             lease_ref: lease.source_token.clone(),
                             segment_id: segment_id.clone(),
                             chunk_base64: BASE64.encode(&buffer[..count]),
                         },
-                    ).await?;
+                    ).await {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let _ = client.complete(
+                            writer_request_id(&session_id, "write-failed", sequence, None),
+                            RecordingWriterSegmentCompleteRequest {
+                                lease_ref: lease.source_token.clone(),
+                                segment_id: segment_id.clone(),
+                                state: "interrupted".into(),
+                                bytes_done: Some(bytes_done),
+                                hash_sha256: Some(digest_hex(&digest)),
+                                error_code: Some("RECORDING_WRITE_FAILED".into()),
+                            },
+                        ).await;
+                        return Err(error);
+                    }
+                    digest.update(&buffer[..count]);
+                    bytes_done = next_bytes_done;
                 }
             }
         }

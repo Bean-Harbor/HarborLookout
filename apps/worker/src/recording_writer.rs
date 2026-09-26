@@ -176,46 +176,51 @@ impl RecordingWriterClient {
         }
         #[cfg(unix)]
         {
-            let request = Request {
-                schema,
-                request_id: request_id.clone(),
-                operation,
-                payload,
-            };
-            let body = serde_json::to_vec(&request)?;
-            if body.len() > MAX_FRAME_BYTES {
-                bail!("recording writer request exceeds the maximum frame size");
-            }
-            let mut stream = UnixStream::connect(&self.socket_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "connect to recording writer socket {}",
-                        self.socket_path.display()
-                    )
-                })?;
-            stream.write_u32(body.len() as u32).await?;
-            stream.write_all(&body).await?;
-            stream.flush().await?;
-            let length = stream.read_u32().await? as usize;
-            if length == 0 || length > MAX_FRAME_BYTES {
-                bail!("recording writer returned an invalid frame length");
-            }
-            let mut response_bytes = vec![0; length];
-            stream.read_exact(&mut response_bytes).await?;
-            let response: Response<R> = serde_json::from_slice(&response_bytes)?;
-            if response.schema != schema || response.request_id != request_id {
-                bail!("recording writer response identity does not match the request");
-            }
-            if !response.ok {
-                let error = response
-                    .error
-                    .ok_or_else(|| anyhow!("recording writer returned an error without details"))?;
-                bail!("{}: {}", error.code, error.message);
-            }
-            response
-                .data
-                .ok_or_else(|| anyhow!("recording writer response did not contain data"))
+            tokio::time::timeout(std::time::Duration::from_secs(25), async {
+                let request = Request {
+                    schema,
+                    request_id: request_id.clone(),
+                    operation,
+                    payload,
+                };
+                let body = serde_json::to_vec(&request)?;
+                if body.len() > MAX_FRAME_BYTES {
+                    bail!("recording writer request exceeds the maximum frame size");
+                }
+                let mut stream =
+                    UnixStream::connect(&self.socket_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "connect to recording writer socket {}",
+                                self.socket_path.display()
+                            )
+                        })?;
+                stream.write_u32(body.len() as u32).await?;
+                stream.write_all(&body).await?;
+                stream.flush().await?;
+                let length = stream.read_u32().await? as usize;
+                if length == 0 || length > MAX_FRAME_BYTES {
+                    bail!("recording writer returned an invalid frame length");
+                }
+                let mut response_bytes = vec![0; length];
+                stream.read_exact(&mut response_bytes).await?;
+                let response: Response<R> = serde_json::from_slice(&response_bytes)?;
+                if response.schema != schema || response.request_id != request_id {
+                    bail!("recording writer response identity does not match the request");
+                }
+                if !response.ok {
+                    let error = response.error.ok_or_else(|| {
+                        anyhow!("recording writer returned an error without details")
+                    })?;
+                    bail!("{}: {}", error.code, error.message);
+                }
+                response
+                    .data
+                    .ok_or_else(|| anyhow!("recording writer response did not contain data"))
+            })
+            .await
+            .context("recording writer IPC timed out")?
         }
     }
 }
